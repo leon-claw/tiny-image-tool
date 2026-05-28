@@ -51,6 +51,8 @@ const defaultOptions: CompressOptions = {
   preserveComfyWorkflow: true,
 };
 
+const MAX_PARALLEL_COMPRESSIONS = 5;
+
 type ToastTone = "info" | "success" | "warning" | "error";
 
 type ToastMessage = {
@@ -80,6 +82,7 @@ function App() {
   const configSaveRef = useRef<Promise<AppConfig | null>>(Promise.resolve(null));
   const configSaveVersionRef = useRef(0);
   const configRef = useRef<AppConfig>(defaultConfig);
+  const activeProviderRef = useRef<Provider>("Compresto");
 
   const stats = useMemo(() => {
     const original = totalBytes(queue, "size");
@@ -111,6 +114,10 @@ function App() {
   useEffect(() => {
     configRef.current = config;
   }, [config]);
+
+  useEffect(() => {
+    activeProviderRef.current = activeProvider;
+  }, [activeProvider]);
 
   function showToast(message: string, tone: ToastTone = "info") {
     if (toastTimerRef.current) {
@@ -223,8 +230,6 @@ function App() {
   }
 
   async function startCompression() {
-    const runProvider = activeProvider;
-    const runKeyId = activeKeyId(config, runProvider);
     const runnable = queue.filter(
       (item) => !item.isCompressed && (item.status === "queued" || item.status === "failed" || item.status === "cancelled"),
     );
@@ -232,8 +237,8 @@ function App() {
       showToast(queue.length ? "当前没有可压缩的图片。已压缩文件会被自动跳过。" : "请先选择文件或文件夹。", "warning");
       return;
     }
-    if (!hasUsableApiKey(config, runProvider)) {
-      showToast(`请先添加并选择 ${runProvider} API Key，再开始压缩。`, "warning");
+    if (!hasUsableApiKey(config, activeProvider)) {
+      showToast(`请先添加并选择 ${activeProvider} API Key，再开始压缩。`, "warning");
       return;
     }
     if (outputPolicy === "CustomDirectory" && !customOutputDir) {
@@ -248,11 +253,26 @@ function App() {
     setIsPauseRequested(false);
     setIsRunning(true);
     await configSaveRef.current;
-    setNotice(`正在使用 ${runProvider} 处理 ${runnable.length} 个文件。`);
+    setNotice(
+      `正在处理 ${runnable.length} 个文件，最多 ${MAX_PARALLEL_COMPRESSIONS} 个并行。每张图片会使用派发时选中的 API Key。`,
+    );
 
-    for (const item of runnable) {
-      if (pauseRef.current) {
-        break;
+    let nextIndex = 0;
+
+    async function processItem(item: QueueItem) {
+      await configSaveRef.current;
+      const currentConfig = configRef.current;
+      const itemProvider = activeProviderRef.current;
+      const itemKeyId = activeKeyId(currentConfig, itemProvider);
+      if (!hasUsableApiKey(currentConfig, itemProvider)) {
+        setQueue((current) =>
+          current.map((candidate) =>
+            candidate.id === item.id
+              ? { ...candidate, status: "failed", error: `${itemProvider} API Key 不可用，请重新选择。` }
+              : candidate,
+          ),
+        );
+        return;
       }
 
       setQueue((current) =>
@@ -264,8 +284,8 @@ function App() {
       try {
         const result = await invoke<CompressResult>("compress_image", {
           path: item.path,
-          provider: runProvider,
-          keyId: runKeyId,
+          provider: itemProvider,
+          keyId: itemKeyId,
           options: normalizeOptions(options),
           outputPolicy,
           customOutputDir: customOutputDir || null,
@@ -288,14 +308,14 @@ function App() {
 
         if (result.usage) {
           setUsage((current) =>
-            activeKeyId(configRef.current, result.provider) === runKeyId
+            activeKeyId(configRef.current, result.provider) === itemKeyId
               ? { ...current, [result.provider]: result.usage ?? null }
               : current,
           );
-          setConfig((current) => applyUsageToConfig(current, result.provider, result.usage as UsageResult, runKeyId));
+          setConfig((current) => applyUsageToConfig(current, result.provider, result.usage as UsageResult, itemKeyId));
         }
         if (pauseRef.current) {
-          break;
+          return;
         }
       } catch (error) {
         setQueue((current) =>
@@ -305,6 +325,18 @@ function App() {
         );
       }
     }
+
+    async function worker() {
+      while (!pauseRef.current) {
+        const item = runnable[nextIndex];
+        nextIndex += 1;
+        if (!item) return;
+        await processItem(item);
+      }
+    }
+
+    const workerCount = Math.min(MAX_PARALLEL_COMPRESSIONS, runnable.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     setIsRunning(false);
     setIsPauseRequested(false);
@@ -318,11 +350,18 @@ function App() {
   }
 
   function persistKeyChange(nextConfig: AppConfig, message: string) {
+    const previousConfig = configRef.current;
     setConfig(nextConfig);
     setUsage(usageFromConfig(nextConfig));
     const version = configSaveVersionRef.current + 1;
     configSaveVersionRef.current = version;
-    configSaveRef.current = saveConfig(nextConfig, message, version);
+    configSaveRef.current = saveConfig(nextConfig, message, version).then((saved) => {
+      if (!saved && version === configSaveVersionRef.current) {
+        setConfig(previousConfig);
+        setUsage(usageFromConfig(previousConfig));
+      }
+      return saved;
+    });
     void configSaveRef.current;
   }
 
@@ -343,6 +382,11 @@ function App() {
 
   function removeOne(id: string) {
     setQueue((current) => current.filter((item) => item.id !== id));
+  }
+
+  function selectProvider(provider: Provider) {
+    activeProviderRef.current = provider;
+    setActiveProvider(provider);
   }
 
   return (
@@ -432,14 +476,14 @@ function App() {
           <button
             type="button"
             className={activeProvider === "Compresto" ? "active" : ""}
-            onClick={() => setActiveProvider("Compresto")}
+            onClick={() => selectProvider("Compresto")}
           >
             Compresto
           </button>
           <button
             type="button"
             className={activeProvider === "Tinify" ? "active" : ""}
-            onClick={() => setActiveProvider("Tinify")}
+            onClick={() => selectProvider("Tinify")}
           >
             Tinify
           </button>
@@ -450,8 +494,9 @@ function App() {
             config={config}
             setConfig={setConfig}
             saveConfig={saveConfig}
-            persistKeyChange={persistKeyChange}
-            outputPolicy={outputPolicy}
+          persistKeyChange={persistKeyChange}
+          notify={showToast}
+          outputPolicy={outputPolicy}
             setOutputPolicy={setOutputPolicy}
             chooseOutputDir={chooseOutputDir}
             customOutputDir={customOutputDir}
@@ -465,6 +510,7 @@ function App() {
             setConfig={setConfig}
             saveConfig={saveConfig}
             persistKeyChange={persistKeyChange}
+            notify={showToast}
             options={options}
             setOptions={setOptions}
             outputPolicy={outputPolicy}
@@ -497,6 +543,7 @@ function App() {
 function ComprestoSettings({
   config,
   persistKeyChange,
+  notify,
   outputPolicy,
   setOutputPolicy,
   chooseOutputDir,
@@ -508,7 +555,7 @@ function ComprestoSettings({
   return (
     <div className="settings-content">
       <Panel title="API Key" icon={<KeyRound size={18} />}>
-        <ApiKeyManager provider="Compresto" config={config} persistKeyChange={persistKeyChange} />
+        <ApiKeyManager provider="Compresto" config={config} persistKeyChange={persistKeyChange} notify={notify} />
       </Panel>
       <OutputPanel {...{ outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir }} />
       <UsagePanel provider="Compresto" result={usage} onRefresh={refreshUsage} loading={loading} />
@@ -519,6 +566,7 @@ function ComprestoSettings({
 function TinifySettings({
   config,
   persistKeyChange,
+  notify,
   options,
   setOptions,
   outputPolicy,
@@ -535,7 +583,7 @@ function TinifySettings({
   return (
     <div className="settings-content">
       <Panel title="API Key" icon={<KeyRound size={18} />}>
-        <ApiKeyManager provider="Tinify" config={config} persistKeyChange={persistKeyChange} />
+        <ApiKeyManager provider="Tinify" config={config} persistKeyChange={persistKeyChange} notify={notify} />
       </Panel>
 
       <Panel title="Tinify 参数" icon={<Layers3 size={18} />}>
@@ -600,6 +648,7 @@ type SettingsProps = {
   setConfig: (config: AppConfig) => void;
   saveConfig: () => void;
   persistKeyChange: (config: AppConfig, message: string) => void;
+  notify: (message: string, tone?: ToastTone) => void;
   outputPolicy: OutputPolicy;
   setOutputPolicy: (policy: OutputPolicy) => void;
   chooseOutputDir: () => void;
@@ -613,10 +662,12 @@ function ApiKeyManager({
   provider,
   config,
   persistKeyChange,
+  notify,
 }: {
   provider: Provider;
   config: AppConfig;
   persistKeyChange: (config: AppConfig, message: string) => void;
+  notify: (message: string, tone?: ToastTone) => void;
 }) {
   const [draftKey, setDraftKey] = useState("");
   const [pendingDelete, setPendingDelete] = useState<ApiKeyEntry | null>(null);
@@ -626,6 +677,11 @@ function ApiKeyManager({
   function addKey() {
     const key = draftKey.trim();
     if (!key) return;
+    if (hasDuplicateKey(keys, key)) {
+      notify(`${provider} API Key 已存在，请勿重复添加。`, "error");
+      return;
+    }
+
     const entry: ApiKeyEntry = {
       id: `${provider.toLowerCase()}-${Date.now()}`,
       label: maskKey(key),
@@ -921,6 +977,15 @@ function hasUsableApiKey(config: AppConfig, provider: Provider): boolean {
   const activeValue = activeKey(config, provider)?.key.trim();
   const legacyValue = provider === "Compresto" ? config.comprestoApiKey.trim() : config.tinifyApiKey.trim();
   return Boolean(activeValue || (legacyValue && !isMaskedSecret(legacyValue)));
+}
+
+function hasDuplicateKey(keys: ApiKeyEntry[], value: string): boolean {
+  const normalized = value.trim();
+  const masked = maskKey(normalized);
+  return keys.some((entry) => {
+    const savedKey = entry.key.trim();
+    return savedKey === normalized || savedKey === masked || entry.label === masked;
+  });
 }
 
 function setProviderKeys(config: AppConfig, provider: Provider, keys: ApiKeyEntry[]): AppConfig {

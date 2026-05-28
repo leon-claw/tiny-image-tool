@@ -39,6 +39,8 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), ConfigError> {
     merge_preserved_keys(&mut next.compresto_keys, &existing.compresto_keys);
     merge_preserved_keys(&mut next.tinify_keys, &existing.tinify_keys);
     next = normalize_app_config(next);
+    ensure_unique_keys(Provider::Compresto, &next.compresto_keys)?;
+    ensure_unique_keys(Provider::Tinify, &next.tinify_keys)?;
     let path = config_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -215,6 +217,22 @@ fn normalize_entries(provider: Provider, entries: &mut Vec<ApiKeyEntry>) {
     }
 }
 
+fn ensure_unique_keys(provider: Provider, entries: &[ApiKeyEntry]) -> Result<(), ConfigError> {
+    for (index, entry) in entries.iter().enumerate() {
+        let key = entry.key.trim();
+        if key.is_empty() || is_masked_secret(key) {
+            continue;
+        }
+        if entries[index + 1..]
+            .iter()
+            .any(|candidate| candidate.key.trim() == key)
+        {
+            return Err(ConfigError::DuplicateApiKey(provider));
+        }
+    }
+    Ok(())
+}
+
 fn merge_preserved_keys(next: &mut [ApiKeyEntry], existing: &[ApiKeyEntry]) {
     for entry in next {
         if entry.key.contains('•') {
@@ -345,6 +363,8 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
     #[error("{0:?} API key is not configured")]
     MissingApiKey(Provider),
+    #[error("{0:?} API key already exists")]
+    DuplicateApiKey(Provider),
 }
 
 #[allow(dead_code)]
