@@ -4,6 +4,8 @@ mod diagnostics;
 mod files;
 mod metadata;
 mod models;
+mod power;
+mod watcher;
 
 use std::path::Path;
 
@@ -11,14 +13,21 @@ use api::{
     compress_with_compresto, compress_with_tinify, fetch_compresto_usage, fetch_tinify_usage,
 };
 use config::{load_app_config, save_app_config};
-use files::{scan_image_paths, write_output_file};
+use files::{scan_image_folder, scan_image_paths, write_output_file};
 use models::{
     AppConfig, CompressOptions, CompressResult, ImageFile, OutputPolicy, Provider, UsageResult,
 };
+use power::{begin_power_assertion, end_power_assertion, PowerAssertionState};
+use watcher::{start_folder_watch, stop_folder_watch, FolderWatcherState};
 
 #[tauri::command]
 fn scan_paths(paths: Vec<String>) -> Result<Vec<ImageFile>, String> {
     scan_image_paths(paths).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn scan_folder(folder: String, recursive: bool) -> Result<Vec<ImageFile>, String> {
+    scan_image_folder(folder, recursive).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -101,13 +110,20 @@ async fn compress_image(
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(FolderWatcherState::default())
+        .manage(PowerAssertionState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             scan_paths,
+            scan_folder,
             load_config,
             save_config,
             refresh_usage,
-            compress_image
+            compress_image,
+            start_folder_watch,
+            stop_folder_watch,
+            begin_power_assertion,
+            end_power_assertion
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tiny Image Tool");

@@ -10,6 +10,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:build:windows": "tauri build --bundles nsis,msi",
+    "build:windows": "bash scripts/build-windows.sh",
     "test": "vitest run"
   },
   "dependencies": {
@@ -29,4 +31,3 @@
     "vitest": "^2.0.5"
   }
 }
-

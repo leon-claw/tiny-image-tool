@@ -11,6 +11,9 @@ export interface AppConfig {
   tinifyKeys: ApiKeyEntry[];
   activeComprestoKeyId?: string | null;
   activeTinifyKeyId?: string | null;
+  watchFolderEnabled: boolean;
+  watchFolderPath?: string | null;
+  keepAwakeDuringCompression: boolean;
 }
 
 export interface ApiKeyEntry {

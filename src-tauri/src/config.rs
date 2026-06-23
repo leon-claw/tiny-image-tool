@@ -138,6 +138,13 @@ fn save_exact_config(config: &AppConfig) -> Result<(), ConfigError> {
 }
 
 fn normalize_app_config(mut config: AppConfig) -> AppConfig {
+    config.watch_folder_path = config
+        .watch_folder_path
+        .and_then(|path| (!path.trim().is_empty()).then(|| path.trim().to_string()));
+    if config.watch_folder_path.is_none() {
+        config.watch_folder_enabled = false;
+    }
+
     if config.compresto_keys.is_empty() && !config.compresto_api_key.trim().is_empty() {
         config.compresto_keys.push(entry_from_legacy(
             Provider::Compresto,

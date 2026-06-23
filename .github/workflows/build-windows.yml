@@ -1,0 +1,86 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading v, for manual builds only"
+        required: false
+        default: "0.1.0"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $version = $tag.TrimStart("v")
+          } else {
+            $version = "${{ inputs.version }}"
+            $tag = "v$version"
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Invalid release version: $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Apply release version
+        shell: pwsh
+        run: |
+          npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.version = "${{ steps.version.outputs.version }}"
+          $config | ConvertTo-Json -Depth 100 | Set-Content $configPath
+
+      - name: Build Windows bundles
+        run: npm run tauri:build:windows
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-image-tool-windows-x64
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Create draft GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Tiny Image Tool ${{ steps.version.outputs.tag }}
+          draft: true
+          prerelease: false
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi

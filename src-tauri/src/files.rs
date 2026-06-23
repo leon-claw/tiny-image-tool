@@ -36,6 +36,35 @@ pub fn scan_image_paths(paths: Vec<String>) -> Result<Vec<ImageFile>, FileError>
     Ok(files.into_values().collect())
 }
 
+pub fn scan_image_folder(folder: String, recursive: bool) -> Result<Vec<ImageFile>, FileError> {
+    let path = PathBuf::from(folder);
+    if !path.is_dir() {
+        return Err(FileError::InvalidSourcePath);
+    }
+
+    let mut files = BTreeMap::new();
+    if recursive {
+        for entry in WalkDir::new(&path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file() {
+                add_image(entry.path(), &mut files)?;
+            }
+        }
+    } else {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                add_image(&entry.path(), &mut files)?;
+            }
+        }
+    }
+
+    Ok(files.into_values().collect())
+}
+
 pub fn write_output_file(
     source_path: &str,
     bytes: &[u8],
@@ -161,5 +190,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("/tmp/compressed/photo.webp"));
+    }
+
+    #[test]
+    fn scans_current_folder_without_recursing() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("root.jpg"), [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        fs::write(
+            temp.path().join("nested").join("child.jpg"),
+            [0xff, 0xd8, 0xff, 0xd9],
+        )
+        .unwrap();
+
+        let files = scan_image_folder(temp.path().to_string_lossy().to_string(), false).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "root.jpg");
     }
 }

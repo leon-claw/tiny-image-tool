@@ -25,6 +25,12 @@ pub struct AppConfig {
     pub active_compresto_key_id: Option<String>,
     #[serde(default)]
     pub active_tinify_key_id: Option<String>,
+    #[serde(default)]
+    pub watch_folder_enabled: bool,
+    #[serde(default)]
+    pub watch_folder_path: Option<String>,
+    #[serde(default = "default_true")]
+    pub keep_awake_during_compression: bool,
 }
 
 impl Default for AppConfig {
@@ -38,6 +44,9 @@ impl Default for AppConfig {
             tinify_keys: Vec::new(),
             active_compresto_key_id: None,
             active_tinify_key_id: None,
+            watch_folder_enabled: false,
+            watch_folder_path: None,
+            keep_awake_during_compression: true,
         }
     }
 }
@@ -57,8 +66,21 @@ impl AppConfig {
             tinify_keys: self.tinify_keys.iter().map(ApiKeyEntry::masked).collect(),
             active_compresto_key_id: self.active_compresto_key_id.clone(),
             active_tinify_key_id: self.active_tinify_key_id.clone(),
+            watch_folder_enabled: self.watch_folder_enabled,
+            watch_folder_path: self.watch_folder_path.clone(),
+            keep_awake_during_compression: self.keep_awake_during_compression,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchFolderEvent {
+    pub folder: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

@@ -16,6 +16,7 @@ import {
   Play,
   Plus,
   RefreshCcw,
+  ArrowDownUp,
   Trash2,
   X,
 } from "lucide-react";
@@ -24,6 +25,7 @@ import type {
   ApiKeyEntry,
   CompressOptions,
   CompressResult,
+  ImageFile,
   OutputPolicy,
   Provider,
   QueueItem,
@@ -40,6 +42,9 @@ const defaultConfig: AppConfig = {
   tinifyKeys: [],
   activeComprestoKeyId: null,
   activeTinifyKeyId: null,
+  watchFolderEnabled: false,
+  watchFolderPath: null,
+  keepAwakeDuringCompression: true,
 };
 
 const defaultOptions: CompressOptions = {
@@ -52,8 +57,12 @@ const defaultOptions: CompressOptions = {
 };
 
 const MAX_PARALLEL_COMPRESSIONS = 5;
+const WATCH_SCAN_INTERVAL_MS = 5 * 60 * 1000;
+const WATCH_NEW_FILE_DEBOUNCE_MS = 1600;
 
 type ToastTone = "info" | "success" | "warning" | "error";
+type WatchScanReason = "focus" | "timer" | "new-file" | "manual" | "enabled";
+type StatusSort = "none" | "asc" | "desc";
 
 type ToastMessage = {
   id: number;
@@ -75,6 +84,9 @@ function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [isPauseRequested, setIsPauseRequested] = useState(false);
   const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
+  const [isWatchScanning, setIsWatchScanning] = useState(false);
+  const [watchLastScanAt, setWatchLastScanAt] = useState<string | null>(null);
+  const [statusSort, setStatusSort] = useState<StatusSort>("none");
   const [notice, setNotice] = useState("选择文件或文件夹后开始压缩。已写入埋点的图片会自动跳过。");
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const pauseRef = useRef(false);
@@ -82,7 +94,15 @@ function App() {
   const configSaveRef = useRef<Promise<AppConfig | null>>(Promise.resolve(null));
   const configSaveVersionRef = useRef(0);
   const configRef = useRef<AppConfig>(defaultConfig);
+  const queueRef = useRef<QueueItem[]>([]);
+  const isRunningRef = useRef(false);
+  const optionsRef = useRef<CompressOptions>(defaultOptions);
+  const outputPolicyRef = useRef<OutputPolicy>("Subdirectory");
+  const customOutputDirRef = useRef("");
   const activeProviderRef = useRef<Provider>("Compresto");
+  const watchScanTimerRef = useRef<number | null>(null);
+  const watchScanInFlightRef = useRef(false);
+  const autoRunAfterCurrentBatchRef = useRef(false);
 
   const stats = useMemo(() => {
     const original = totalBytes(queue, "size");
@@ -94,6 +114,8 @@ function App() {
     return { original, compressed, done, failed, already, selected };
   }, [queue]);
 
+  const displayQueue = useMemo(() => sortQueueByStatus(queue, statusSort), [queue, statusSort]);
+
   useEffect(() => {
     void loadConfig();
     const unlisten = listen("tauri://drag-drop", (event) => {
@@ -102,12 +124,34 @@ function App() {
         void addPaths(payload.paths);
       }
     });
+    const unlistenWatch = listen("watch-folder-changed", () => {
+      scheduleWatchScan("new-file", WATCH_NEW_FILE_DEBOUNCE_MS);
+    });
+    const intervalId = window.setInterval(() => {
+      scheduleWatchScan("timer");
+    }, WATCH_SCAN_INTERVAL_MS);
+    const handleFocus = () => scheduleWatchScan("focus");
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        scheduleWatchScan("focus");
+      }
+    };
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
       if (toastTimerRef.current) {
         window.clearTimeout(toastTimerRef.current);
       }
+      if (watchScanTimerRef.current) {
+        window.clearTimeout(watchScanTimerRef.current);
+      }
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       void unlisten.then((dispose) => dispose());
+      void unlistenWatch.then((dispose) => dispose());
+      void invoke("stop_folder_watch");
     };
   }, []);
 
@@ -116,8 +160,44 @@ function App() {
   }, [config]);
 
   useEffect(() => {
+    queueRef.current = queue;
+  }, [queue]);
+
+  useEffect(() => {
+    isRunningRef.current = isRunning;
+  }, [isRunning]);
+
+  useEffect(() => {
+    optionsRef.current = options;
+  }, [options]);
+
+  useEffect(() => {
+    outputPolicyRef.current = outputPolicy;
+  }, [outputPolicy]);
+
+  useEffect(() => {
+    customOutputDirRef.current = customOutputDir;
+  }, [customOutputDir]);
+
+  useEffect(() => {
     activeProviderRef.current = activeProvider;
   }, [activeProvider]);
+
+  useEffect(() => {
+    const folder = config.watchFolderPath;
+    if (!config.watchFolderEnabled || !folder) {
+      void invoke("stop_folder_watch");
+      return;
+    }
+
+    void invoke("start_folder_watch", { folder })
+      .then(() => scheduleWatchScan("enabled", 250))
+      .catch((error) => showToast(String(error), "error"));
+
+    return () => {
+      void invoke("stop_folder_watch");
+    };
+  }, [config.watchFolderEnabled, config.watchFolderPath]);
 
   function showToast(message: string, tone: ToastTone = "info") {
     if (toastTimerRef.current) {
@@ -163,7 +243,7 @@ function App() {
   async function addPaths(paths: string[]) {
     try {
       const files = await invoke<QueueItem[]>("scan_paths", { paths });
-      setQueue((current) => [...current, ...toQueueItems(files, current)]);
+      updateQueue((current) => [...current, ...toQueueItems(files, current)]);
       setNotice(`已加载 ${files.length} 个支持的图片文件。`);
     } catch (error) {
       setNotice(String(error));
@@ -192,6 +272,34 @@ function App() {
       setCustomOutputDir(selected);
       setOutputPolicy("CustomDirectory");
     }
+  }
+
+  async function chooseWatchFolder() {
+    const selected = await open({ multiple: false, directory: true });
+    if (typeof selected === "string") {
+      updateWatchConfig({ watchFolderPath: selected, watchFolderEnabled: true }, "监听文件夹已启用。");
+    }
+  }
+
+  function updateWatchConfig(patch: Partial<Pick<AppConfig, "watchFolderEnabled" | "watchFolderPath">>, message: string) {
+    const nextConfig = { ...configRef.current, ...patch };
+    persistKeyChange(nextConfig, message);
+  }
+
+  function toggleWatchFolder(enabled: boolean) {
+    const folder = configRef.current.watchFolderPath;
+    if (enabled && !folder) {
+      showToast("请先选择要监听的文件夹。", "warning");
+      return;
+    }
+    updateWatchConfig({ watchFolderEnabled: enabled }, enabled ? "监听文件夹已启用。" : "监听文件夹已停用。");
+  }
+
+  function toggleKeepAwake(enabled: boolean) {
+    persistKeyChange(
+      { ...configRef.current, keepAwakeDuringCompression: enabled },
+      enabled ? "压缩时保持设备唤醒已开启。" : "压缩时保持设备唤醒已关闭。",
+    );
   }
 
   async function refreshUsage(target: Provider = activeProvider) {
@@ -229,12 +337,67 @@ function App() {
     }
   }
 
+  function scheduleWatchScan(reason: WatchScanReason, delay = 0) {
+    if (watchScanTimerRef.current) {
+      window.clearTimeout(watchScanTimerRef.current);
+    }
+    watchScanTimerRef.current = window.setTimeout(() => {
+      watchScanTimerRef.current = null;
+      void scanWatchedFolder(reason);
+    }, delay);
+  }
+
+  async function scanWatchedFolder(reason: WatchScanReason) {
+    const currentConfig = configRef.current;
+    const folder = currentConfig.watchFolderPath;
+    if (!currentConfig.watchFolderEnabled || !folder) return;
+
+    if (watchScanInFlightRef.current) {
+      scheduleWatchScan(reason, WATCH_NEW_FILE_DEBOUNCE_MS);
+      return;
+    }
+
+    watchScanInFlightRef.current = true;
+    setIsWatchScanning(true);
+    try {
+      const files = await invoke<ImageFile[]>("scan_folder", { folder, recursive: false });
+      const newItems = toQueueItems(files, queueRef.current);
+      if (newItems.length) {
+        updateQueue((current) => [...current, ...toQueueItems(files, current)]);
+      }
+      const watchedPaths = new Set(files.map((file) => file.path));
+
+      const checkedAt = new Date().toISOString();
+      setWatchLastScanAt(checkedAt);
+      if (reason === "manual") {
+        showToast(newItems.length ? `发现 ${newItems.length} 个新图片。` : "监听文件夹没有新图片。", "info");
+      }
+      setNotice(`监听文件夹已扫描：${files.length} 个当前层级图片。`);
+
+      const runnable = runnableItems(queueRef.current).filter((item) => watchedPaths.has(item.path));
+      if (!runnable.length) return;
+      if (outputPolicyRef.current === "Overwrite") {
+        showToast("监听自动压缩不会执行覆盖源文件。请改为 compressed/ 或自定义输出目录。", "warning");
+        return;
+      }
+      const provider = activeProviderRef.current;
+      if (!hasUsableApiKey(configRef.current, provider)) {
+        showToast(`监听发现新图片，但 ${provider} API Key 不可用。`, "warning");
+        return;
+      }
+      await runCompression(runnable, "watch");
+    } catch (error) {
+      showToast(String(error), "error");
+    } finally {
+      watchScanInFlightRef.current = false;
+      setIsWatchScanning(false);
+    }
+  }
+
   async function startCompression() {
-    const runnable = queue.filter(
-      (item) => !item.isCompressed && (item.status === "queued" || item.status === "failed" || item.status === "cancelled"),
-    );
+    const runnable = runnableItems(queueRef.current);
     if (!runnable.length) {
-      showToast(queue.length ? "当前没有可压缩的图片。已压缩文件会被自动跳过。" : "请先选择文件或文件夹。", "warning");
+      showToast(queueRef.current.length ? "当前没有可压缩的图片。已压缩文件会被自动跳过。" : "请先选择文件或文件夹。", "warning");
       return;
     }
     if (!hasUsableApiKey(config, activeProvider)) {
@@ -249,98 +412,144 @@ function App() {
       return;
     }
 
+    await runCompression(runnable, "manual");
+  }
+
+  async function runCompression(runnable: QueueItem[], source: "manual" | "watch") {
+    if (!runnable.length) return;
+    if (isRunningRef.current) {
+      if (source === "watch") {
+        autoRunAfterCurrentBatchRef.current = true;
+      }
+      return;
+    }
+
     pauseRef.current = false;
     setIsPauseRequested(false);
+    isRunningRef.current = true;
     setIsRunning(true);
     await configSaveRef.current;
+    const keepAwakeStarted = await beginKeepAwakeIfNeeded();
     setNotice(
-      `正在处理 ${runnable.length} 个文件，最多 ${MAX_PARALLEL_COMPRESSIONS} 个并行。每张图片会使用派发时选中的 API Key。`,
+      `${source === "watch" ? "监听任务" : "手动任务"}正在处理 ${runnable.length} 个文件，最多 ${MAX_PARALLEL_COMPRESSIONS} 个并行。每张图片会使用派发时选中的 API Key。`,
     );
 
-    let nextIndex = 0;
+    try {
+      let nextIndex = 0;
 
-    async function processItem(item: QueueItem) {
-      await configSaveRef.current;
-      const currentConfig = configRef.current;
-      const itemProvider = activeProviderRef.current;
-      const itemKeyId = activeKeyId(currentConfig, itemProvider);
-      if (!hasUsableApiKey(currentConfig, itemProvider)) {
-        setQueue((current) =>
-          current.map((candidate) =>
-            candidate.id === item.id
-              ? { ...candidate, status: "failed", error: `${itemProvider} API Key 不可用，请重新选择。` }
-              : candidate,
-          ),
-        );
-        return;
-      }
-
-      setQueue((current) =>
-        current.map((candidate) =>
-          candidate.id === item.id ? { ...candidate, status: "processing", error: undefined } : candidate,
-        ),
-      );
-
-      try {
-        const result = await invoke<CompressResult>("compress_image", {
-          path: item.path,
-          provider: itemProvider,
-          keyId: itemKeyId,
-          options: normalizeOptions(options),
-          outputPolicy,
-          customOutputDir: customOutputDir || null,
-        });
-
-        setQueue((current) =>
-          current.map((candidate) =>
-            candidate.id === item.id
-              ? {
-                  ...candidate,
-                  status: "done",
-                  isCompressed: true,
-                  outputPath: result.outputPath,
-                  compressedSize: result.compressedSize,
-                  savingsPercent: result.savingsPercent,
-                }
-              : candidate,
-          ),
-        );
-
-        if (result.usage) {
-          setUsage((current) =>
-            activeKeyId(configRef.current, result.provider) === itemKeyId
-              ? { ...current, [result.provider]: result.usage ?? null }
-              : current,
+      async function processItem(item: QueueItem) {
+        await configSaveRef.current;
+        const currentConfig = configRef.current;
+        const itemProvider = activeProviderRef.current;
+        const itemKeyId = activeKeyId(currentConfig, itemProvider);
+        if (!hasUsableApiKey(currentConfig, itemProvider)) {
+          updateQueue((current) =>
+            current.map((candidate) =>
+              candidate.id === item.id
+                ? { ...candidate, status: "failed", error: `${itemProvider} API Key 不可用，请重新选择。` }
+                : candidate,
+            ),
           );
-          setConfig((current) => applyUsageToConfig(current, result.provider, result.usage as UsageResult, itemKeyId));
-        }
-        if (pauseRef.current) {
           return;
         }
-      } catch (error) {
-        setQueue((current) =>
+
+        updateQueue((current) =>
           current.map((candidate) =>
-            candidate.id === item.id ? { ...candidate, status: "failed", error: String(error) } : candidate,
+            candidate.id === item.id ? { ...candidate, status: "processing", error: undefined } : candidate,
           ),
         );
+
+        try {
+          const result = await invoke<CompressResult>("compress_image", {
+            path: item.path,
+            provider: itemProvider,
+            keyId: itemKeyId,
+            options: normalizeOptions(optionsRef.current),
+            outputPolicy: outputPolicyRef.current,
+            customOutputDir: customOutputDirRef.current || null,
+          });
+
+          updateQueue((current) =>
+            current.map((candidate) =>
+              candidate.id === item.id
+                ? {
+                    ...candidate,
+                    status: "done",
+                    isCompressed: true,
+                    outputPath: result.outputPath,
+                    compressedSize: result.compressedSize,
+                    savingsPercent: result.savingsPercent,
+                  }
+                : candidate,
+            ),
+          );
+
+          if (result.usage) {
+            setUsage((current) =>
+              activeKeyId(configRef.current, result.provider) === itemKeyId
+                ? { ...current, [result.provider]: result.usage ?? null }
+                : current,
+            );
+            setConfig((current) => applyUsageToConfig(current, result.provider, result.usage as UsageResult, itemKeyId));
+          }
+          if (pauseRef.current) {
+            return;
+          }
+        } catch (error) {
+          updateQueue((current) =>
+            current.map((candidate) =>
+              candidate.id === item.id ? { ...candidate, status: "failed", error: String(error) } : candidate,
+            ),
+          );
+        }
       }
+
+      async function worker() {
+        while (!pauseRef.current) {
+          const item = runnable[nextIndex];
+          nextIndex += 1;
+          if (!item) return;
+          await processItem(item);
+        }
+      }
+
+      const workerCount = Math.min(MAX_PARALLEL_COMPRESSIONS, runnable.length);
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    } finally {
+      await endKeepAwakeIfNeeded(keepAwakeStarted);
     }
 
-    async function worker() {
-      while (!pauseRef.current) {
-        const item = runnable[nextIndex];
-        nextIndex += 1;
-        if (!item) return;
-        await processItem(item);
-      }
-    }
-
-    const workerCount = Math.min(MAX_PARALLEL_COMPRESSIONS, runnable.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
-
+    isRunningRef.current = false;
     setIsRunning(false);
     setIsPauseRequested(false);
     setNotice(pauseRef.current ? "已暂停。再次开始会继续处理未完成文件。" : "处理完成。");
+    if (!pauseRef.current && autoRunAfterCurrentBatchRef.current) {
+      autoRunAfterCurrentBatchRef.current = false;
+      const pending = runnableItems(queueRef.current);
+      if (pending.length) {
+        void runCompression(pending, "watch");
+      }
+    }
+  }
+
+  async function beginKeepAwakeIfNeeded(): Promise<boolean> {
+    if (!configRef.current.keepAwakeDuringCompression) return false;
+    try {
+      await invoke("begin_power_assertion");
+      return true;
+    } catch (error) {
+      showToast(`保持设备唤醒未能开启：${String(error)}`, "warning");
+      return false;
+    }
+  }
+
+  async function endKeepAwakeIfNeeded(started: boolean) {
+    if (!started) return;
+    try {
+      await invoke("end_power_assertion");
+    } catch (error) {
+      showToast(`保持设备唤醒未能释放：${String(error)}`, "warning");
+    }
   }
 
   function requestPause() {
@@ -365,28 +574,40 @@ function App() {
     void configSaveRef.current;
   }
 
+  function updateQueue(updater: (current: QueueItem[]) => QueueItem[]) {
+    setQueue((current) => {
+      const next = updater(current);
+      queueRef.current = next;
+      return next;
+    });
+  }
+
   function toggleSelected(id: string) {
-    setQueue((current) =>
+    updateQueue((current) =>
       current.map((item) => (item.id === id ? { ...item, selected: !item.selected } : item)),
     );
   }
 
   function toggleAllSelected() {
     const shouldSelect = stats.selected !== queue.length;
-    setQueue((current) => current.map((item) => ({ ...item, selected: shouldSelect })));
+    updateQueue((current) => current.map((item) => ({ ...item, selected: shouldSelect })));
   }
 
   function removeSelected() {
-    setQueue((current) => current.filter((item) => !item.selected));
+    updateQueue((current) => current.filter((item) => !item.selected));
   }
 
   function removeOne(id: string) {
-    setQueue((current) => current.filter((item) => item.id !== id));
+    updateQueue((current) => current.filter((item) => item.id !== id));
   }
 
   function selectProvider(provider: Provider) {
     activeProviderRef.current = provider;
     setActiveProvider(provider);
+  }
+
+  function toggleStatusSort() {
+    setStatusSort((current) => (current === "none" ? "asc" : current === "asc" ? "desc" : "none"));
   }
 
   return (
@@ -434,7 +655,16 @@ function App() {
               />
               资产
             </label>
-            <span>状态</span>
+            <button
+              type="button"
+              className={statusSort === "none" ? "sort-head" : "sort-head active"}
+              onClick={toggleStatusSort}
+              title="按状态排序"
+            >
+              状态
+              <ArrowDownUp size={13} />
+              {statusSort !== "none" ? <small>{statusSort === "asc" ? "升" : "降"}</small> : null}
+            </button>
             <span>大小</span>
             <span>操作</span>
           </div>
@@ -445,7 +675,7 @@ function App() {
                 <span>未加载图片</span>
               </div>
             ) : (
-              queue.map((item) => (
+              displayQueue.map((item) => (
                 <div className="file-row" key={item.id}>
                   <label className="file-cell">
                     <input type="checkbox" checked={item.selected} onChange={() => toggleSelected(item.id)} />
@@ -496,10 +726,16 @@ function App() {
             saveConfig={saveConfig}
           persistKeyChange={persistKeyChange}
           notify={showToast}
-          outputPolicy={outputPolicy}
+            outputPolicy={outputPolicy}
             setOutputPolicy={setOutputPolicy}
             chooseOutputDir={chooseOutputDir}
             customOutputDir={customOutputDir}
+            toggleKeepAwake={toggleKeepAwake}
+            chooseWatchFolder={chooseWatchFolder}
+            toggleWatchFolder={toggleWatchFolder}
+            scanWatchFolder={() => scanWatchedFolder("manual")}
+            isWatchScanning={isWatchScanning}
+            watchLastScanAt={watchLastScanAt}
             usage={usage.Compresto}
             refreshUsage={() => refreshUsage("Compresto")}
             loading={isRefreshingUsage}
@@ -517,6 +753,12 @@ function App() {
             setOutputPolicy={setOutputPolicy}
             chooseOutputDir={chooseOutputDir}
             customOutputDir={customOutputDir}
+            toggleKeepAwake={toggleKeepAwake}
+            chooseWatchFolder={chooseWatchFolder}
+            toggleWatchFolder={toggleWatchFolder}
+            scanWatchFolder={() => scanWatchedFolder("manual")}
+            isWatchScanning={isWatchScanning}
+            watchLastScanAt={watchLastScanAt}
             usage={usage.Tinify}
             refreshUsage={() => refreshUsage("Tinify")}
             loading={isRefreshingUsage}
@@ -548,6 +790,12 @@ function ComprestoSettings({
   setOutputPolicy,
   chooseOutputDir,
   customOutputDir,
+  toggleKeepAwake,
+  chooseWatchFolder,
+  toggleWatchFolder,
+  scanWatchFolder,
+  isWatchScanning,
+  watchLastScanAt,
   usage,
   refreshUsage,
   loading,
@@ -557,7 +805,15 @@ function ComprestoSettings({
       <Panel title="API Key" icon={<KeyRound size={18} />}>
         <ApiKeyManager provider="Compresto" config={config} persistKeyChange={persistKeyChange} notify={notify} />
       </Panel>
-      <OutputPanel {...{ outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir }} />
+      <OutputPanel {...{ config, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir, toggleKeepAwake }} />
+      <WatchFolderPanel
+        config={config}
+        chooseWatchFolder={chooseWatchFolder}
+        toggleWatchFolder={toggleWatchFolder}
+        scanWatchFolder={scanWatchFolder}
+        isWatchScanning={isWatchScanning}
+        watchLastScanAt={watchLastScanAt}
+      />
       <UsagePanel provider="Compresto" result={usage} onRefresh={refreshUsage} loading={loading} />
     </div>
   );
@@ -573,6 +829,12 @@ function TinifySettings({
   setOutputPolicy,
   chooseOutputDir,
   customOutputDir,
+  toggleKeepAwake,
+  chooseWatchFolder,
+  toggleWatchFolder,
+  scanWatchFolder,
+  isWatchScanning,
+  watchLastScanAt,
   usage,
   refreshUsage,
   loading,
@@ -637,7 +899,15 @@ function TinifySettings({
         </label>
       </Panel>
 
-      <OutputPanel {...{ outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir }} />
+      <OutputPanel {...{ config, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir, toggleKeepAwake }} />
+      <WatchFolderPanel
+        config={config}
+        chooseWatchFolder={chooseWatchFolder}
+        toggleWatchFolder={toggleWatchFolder}
+        scanWatchFolder={scanWatchFolder}
+        isWatchScanning={isWatchScanning}
+        watchLastScanAt={watchLastScanAt}
+      />
       <UsagePanel provider="Tinify" result={usage} onRefresh={refreshUsage} loading={loading} />
     </div>
   );
@@ -653,6 +923,12 @@ type SettingsProps = {
   setOutputPolicy: (policy: OutputPolicy) => void;
   chooseOutputDir: () => void;
   customOutputDir: string;
+  toggleKeepAwake: (enabled: boolean) => void;
+  chooseWatchFolder: () => void;
+  toggleWatchFolder: (enabled: boolean) => void;
+  scanWatchFolder: () => void;
+  isWatchScanning: boolean;
+  watchLastScanAt: string | null;
   usage: UsageResult | null;
   refreshUsage: () => void;
   loading: boolean;
@@ -772,15 +1048,19 @@ function ApiKeyManager({
 }
 
 function OutputPanel({
+  config,
   outputPolicy,
   setOutputPolicy,
   chooseOutputDir,
   customOutputDir,
+  toggleKeepAwake,
 }: {
+  config: AppConfig;
   outputPolicy: OutputPolicy;
   setOutputPolicy: (policy: OutputPolicy) => void;
   chooseOutputDir: () => void;
   customOutputDir: string;
+  toggleKeepAwake: (enabled: boolean) => void;
 }) {
   return (
     <Panel title="输出" icon={<FolderOpen size={18} />}>
@@ -794,6 +1074,63 @@ function OutputPanel({
         选择输出目录
       </button>
       <p className="hint">{outputPolicy === "CustomDirectory" ? customOutputDir || "尚未选择目录" : "compressed/"}</p>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={config.keepAwakeDuringCompression}
+          onChange={(event) => toggleKeepAwake(event.target.checked)}
+        />
+        压缩时保持设备唤醒
+      </label>
+    </Panel>
+  );
+}
+
+function WatchFolderPanel({
+  config,
+  chooseWatchFolder,
+  toggleWatchFolder,
+  scanWatchFolder,
+  isWatchScanning,
+  watchLastScanAt,
+}: {
+  config: AppConfig;
+  chooseWatchFolder: () => void;
+  toggleWatchFolder: (enabled: boolean) => void;
+  scanWatchFolder: () => void;
+  isWatchScanning: boolean;
+  watchLastScanAt: string | null;
+}) {
+  return (
+    <Panel title="文件夹监听" icon={<FolderOpen size={18} />}>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={config.watchFolderEnabled}
+          onChange={(event) => toggleWatchFolder(event.target.checked)}
+        />
+        自动扫描并压缩当前文件夹图片
+      </label>
+      <button className="ghost" type="button" onClick={chooseWatchFolder}>
+        <FolderOpen size={16} />
+        选择监听文件夹
+      </button>
+      <p className="hint">{config.watchFolderPath || "尚未选择文件夹"}</p>
+      <div className="watch-actions">
+        <button
+          type="button"
+          className="refresh-button"
+          onClick={scanWatchFolder}
+          disabled={!config.watchFolderEnabled || !config.watchFolderPath || isWatchScanning}
+        >
+          {isWatchScanning ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />}
+          立即扫描
+        </button>
+        <span className={config.watchFolderEnabled ? "watch-state active" : "watch-state"}>
+          {config.watchFolderEnabled ? "监听中" : "已停用"}
+        </span>
+      </div>
+      <p className="hint">最近扫描：{watchLastScanAt ? formatDateTime(watchLastScanAt) : "Never"}</p>
     </Panel>
   );
 }
@@ -957,6 +1294,29 @@ function normalizeOptions(options: CompressOptions): CompressOptions {
     maxWidth: options.maxWidth ?? null,
     maxHeight: options.maxHeight ?? null,
   };
+}
+
+function runnableItems(items: QueueItem[]): QueueItem[] {
+  return items.filter(
+    (item) => !item.isCompressed && (item.status === "queued" || item.status === "failed" || item.status === "cancelled"),
+  );
+}
+
+function sortQueueByStatus(items: QueueItem[], sort: StatusSort): QueueItem[] {
+  if (sort === "none") return items;
+  const direction = sort === "asc" ? 1 : -1;
+  return [...items].sort((a, b) => {
+    const statusDelta = statusRank(a) - statusRank(b);
+    if (statusDelta !== 0) return statusDelta * direction;
+    return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  });
+}
+
+function statusRank(item: QueueItem): number {
+  if (item.isCompressed || item.status === "done") return 3;
+  if (item.status === "processing") return 1;
+  if (item.status === "failed") return 2;
+  return 0;
 }
 
 function providerKeys(config: AppConfig, provider: Provider): ApiKeyEntry[] {
