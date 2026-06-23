@@ -13,6 +13,7 @@ export interface AppConfig {
   activeTinifyKeyId?: string | null;
   watchFolderEnabled: boolean;
   watchFolderPath?: string | null;
+  watchFolders: WatchFolderConfig[];
   keepAwakeDuringCompression: boolean;
 }
 
@@ -32,6 +33,33 @@ export interface ImageFile {
   extension: string;
   size: number;
   isCompressed: boolean;
+}
+
+export interface WatchFolderConfig {
+  id: string;
+  path: string;
+  enabled: boolean;
+  lastScannedAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface WatchFolderScan {
+  folder: string;
+  allFiles: number;
+  supportedFiles: number;
+  compressedFiles: number;
+  uncompressedFiles: number;
+  files: ImageFile[];
+}
+
+export interface WatchFolderSummary extends WatchFolderConfig {
+  allFiles: number;
+  supportedFiles: number;
+  compressedFiles: number;
+  uncompressedFiles: number;
+  processingFiles: number;
+  failedFiles: number;
+  queuedFiles: number;
 }
 
 export interface QueueItem extends ImageFile {

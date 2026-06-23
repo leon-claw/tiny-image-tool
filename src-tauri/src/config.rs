@@ -6,7 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::models::{mask_secret, ApiKeyEntry, AppConfig, Provider, UsageResult};
+use crate::models::{
+    mask_secret, ApiKeyEntry, AppConfig, Provider, UsageResult, WatchFolderConfig,
+};
 
 pub fn load_app_config() -> Result<AppConfig, ConfigError> {
     let path = config_path()?;
@@ -141,7 +143,8 @@ fn normalize_app_config(mut config: AppConfig) -> AppConfig {
     config.watch_folder_path = config
         .watch_folder_path
         .and_then(|path| (!path.trim().is_empty()).then(|| path.trim().to_string()));
-    if config.watch_folder_path.is_none() {
+    normalize_watch_folders(&mut config);
+    if config.watch_folders.is_empty() {
         config.watch_folder_enabled = false;
     }
 
@@ -193,6 +196,41 @@ fn normalize_app_config(mut config: AppConfig) -> AppConfig {
         config.tinify_last_checked_at = None;
     }
     config
+}
+
+fn normalize_watch_folders(config: &mut AppConfig) {
+    if config.watch_folders.is_empty() {
+        if let Some(path) = config.watch_folder_path.clone() {
+            config.watch_folders.push(WatchFolderConfig {
+                id: watch_folder_id(&path, 0),
+                path,
+                enabled: config.watch_folder_enabled,
+                last_scanned_at: None,
+                last_error: None,
+            });
+        }
+    }
+
+    for (index, folder) in config.watch_folders.iter_mut().enumerate() {
+        folder.path = folder.path.trim().to_string();
+        if folder.id.trim().is_empty() {
+            folder.id = watch_folder_id(&folder.path, index);
+        }
+    }
+    config
+        .watch_folders
+        .retain(|folder| !folder.path.is_empty());
+    dedupe_watch_folders(&mut config.watch_folders);
+    config.watch_folder_path = config
+        .watch_folders
+        .first()
+        .map(|folder| folder.path.clone());
+    config.watch_folder_enabled = config.watch_folders.iter().any(|folder| folder.enabled);
+}
+
+fn dedupe_watch_folders(folders: &mut Vec<WatchFolderConfig>) {
+    let mut seen = std::collections::BTreeSet::new();
+    folders.retain(|folder| seen.insert(folder.path.clone()));
 }
 
 fn clear_deleted_masked_legacy_fields(config: &mut AppConfig) {
@@ -343,6 +381,13 @@ fn key_id(provider: Provider, key: &str, index: usize) -> String {
     format!("{prefix}-{:x}", hasher.finish())
 }
 
+fn watch_folder_id(path: &str, index: usize) -> String {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    index.hash(&mut hasher);
+    format!("watch-{:x}", hasher.finish())
+}
+
 fn non_empty(value: String) -> Option<String> {
     if value.trim().is_empty() {
         None
@@ -452,5 +497,49 @@ mod tests {
         assert_eq!(second.used, Some(42));
         assert_eq!(second.limit, Some(100));
         assert_eq!(second.remaining, Some(58));
+    }
+
+    #[test]
+    fn migrates_legacy_watch_folder_to_watch_folders() {
+        let config = AppConfig {
+            watch_folder_enabled: true,
+            watch_folder_path: Some("/tmp/images".to_string()),
+            ..AppConfig::default()
+        };
+
+        let normalized = normalize_app_config(config);
+
+        assert_eq!(normalized.watch_folders.len(), 1);
+        assert_eq!(normalized.watch_folders[0].path, "/tmp/images");
+        assert!(normalized.watch_folders[0].enabled);
+        assert_eq!(normalized.watch_folder_path.as_deref(), Some("/tmp/images"));
+        assert!(normalized.watch_folder_enabled);
+    }
+
+    #[test]
+    fn deduplicates_watch_folders_by_path() {
+        let config = AppConfig {
+            watch_folders: vec![
+                WatchFolderConfig {
+                    id: "a".to_string(),
+                    path: "/tmp/images".to_string(),
+                    enabled: true,
+                    last_scanned_at: None,
+                    last_error: None,
+                },
+                WatchFolderConfig {
+                    id: "b".to_string(),
+                    path: "/tmp/images".to_string(),
+                    enabled: true,
+                    last_scanned_at: None,
+                    last_error: None,
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        let normalized = normalize_app_config(config);
+
+        assert_eq!(normalized.watch_folders.len(), 1);
     }
 }

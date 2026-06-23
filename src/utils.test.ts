@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, toQueueItems, totalBytes } from "./utils";
+import { formatBytes, prioritizeQueueByStatus, toQueueItems, totalBytes } from "./utils";
 
 describe("utils", () => {
   it("formats bytes for compact display", () => {
@@ -32,5 +32,25 @@ describe("utils", () => {
         "compressedSize",
       ),
     ).toBe(20);
+  });
+
+  it("moves the selected status to the front while keeping default order for everything else", () => {
+    const items = [
+      { id: "queued-a", path: "queued-a", name: "queued-a", extension: "png", size: 100, isCompressed: false, selected: false, status: "queued" as const },
+      { id: "failed-a", path: "failed-a", name: "failed-a", extension: "png", size: 100, isCompressed: false, selected: false, status: "failed" as const },
+      { id: "processing-a", path: "processing-a", name: "processing-a", extension: "png", size: 100, isCompressed: false, selected: false, status: "processing" as const },
+      { id: "failed-b", path: "failed-b", name: "failed-b", extension: "png", size: 100, isCompressed: false, selected: false, status: "failed" as const },
+      { id: "done-a", path: "done-a", name: "done-a", extension: "png", size: 100, isCompressed: true, selected: false, status: "queued" as const },
+    ];
+
+    expect(prioritizeQueueByStatus(items, "failed").map((item) => item.id)).toEqual([
+      "failed-a",
+      "failed-b",
+      "queued-a",
+      "processing-a",
+      "done-a",
+    ]);
+    expect(prioritizeQueueByStatus(items, "done").map((item) => item.id)[0]).toBe("done-a");
+    expect(prioritizeQueueByStatus(items, "default")).toBe(items);
   });
 });

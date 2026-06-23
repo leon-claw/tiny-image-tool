@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub watch_folder_enabled: bool,
     #[serde(default)]
     pub watch_folder_path: Option<String>,
+    #[serde(default)]
+    pub watch_folders: Vec<WatchFolderConfig>,
     #[serde(default = "default_true")]
     pub keep_awake_during_compression: bool,
 }
@@ -46,6 +48,7 @@ impl Default for AppConfig {
             active_tinify_key_id: None,
             watch_folder_enabled: false,
             watch_folder_path: None,
+            watch_folders: Vec::new(),
             keep_awake_during_compression: true,
         }
     }
@@ -68,6 +71,7 @@ impl AppConfig {
             active_tinify_key_id: self.active_tinify_key_id.clone(),
             watch_folder_enabled: self.watch_folder_enabled,
             watch_folder_path: self.watch_folder_path.clone(),
+            watch_folders: self.watch_folders.clone(),
             keep_awake_during_compression: self.keep_awake_during_compression,
         }
     }
@@ -81,6 +85,30 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct WatchFolderEvent {
     pub folder: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchFolderConfig {
+    pub id: String,
+    pub path: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub last_scanned_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchFolderScan {
+    pub folder: String,
+    pub all_files: usize,
+    pub supported_files: usize,
+    pub compressed_files: usize,
+    pub uncompressed_files: usize,
+    pub files: Vec<ImageFile>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

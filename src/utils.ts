@@ -1,5 +1,7 @@
 import type { ImageFile, QueueItem } from "./types";
 
+export type StatusFilter = "default" | "queued" | "processing" | "failed" | "done" | "cancelled";
+
 export function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
@@ -35,4 +37,24 @@ export function toQueueItems(files: ImageFile[], existing: QueueItem[]): QueueIt
 
 export function totalBytes(items: QueueItem[], key: "size" | "compressedSize"): number {
   return items.reduce((sum, item) => sum + (item[key] ?? 0), 0);
+}
+
+export function prioritizeQueueByStatus(items: QueueItem[], filter: StatusFilter): QueueItem[] {
+  if (filter === "default") return items;
+
+  const pinned: QueueItem[] = [];
+  const rest: QueueItem[] = [];
+  for (const item of items) {
+    if (queueStatus(item) === filter) {
+      pinned.push(item);
+    } else {
+      rest.push(item);
+    }
+  }
+  return [...pinned, ...rest];
+}
+
+export function queueStatus(item: QueueItem): Exclude<StatusFilter, "default"> {
+  if (item.isCompressed || item.status === "done") return "done";
+  return item.status;
 }

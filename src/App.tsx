@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
+  ChevronRight,
   CheckCircle2,
   CircleDot,
   FileImage,
@@ -11,14 +12,15 @@ import {
   Gauge,
   KeyRound,
   Layers3,
+  ListTree,
   Loader2,
   Pause,
   Play,
   Plus,
   RefreshCcw,
-  ArrowDownUp,
   Trash2,
   X,
+  Square,
 } from "lucide-react";
 import type {
   AppConfig,
@@ -30,8 +32,19 @@ import type {
   Provider,
   QueueItem,
   UsageResult,
+  WatchFolderConfig,
+  WatchFolderScan,
+  WatchFolderSummary,
 } from "./types";
-import { formatBytes, formatDateTime, toQueueItems, totalBytes } from "./utils";
+import appIcon from "./assets/app-icon.png";
+import {
+  formatBytes,
+  formatDateTime,
+  prioritizeQueueByStatus,
+  toQueueItems,
+  totalBytes,
+  type StatusFilter,
+} from "./utils";
 
 const defaultConfig: AppConfig = {
   comprestoApiKey: "",
@@ -44,6 +57,7 @@ const defaultConfig: AppConfig = {
   activeTinifyKeyId: null,
   watchFolderEnabled: false,
   watchFolderPath: null,
+  watchFolders: [],
   keepAwakeDuringCompression: true,
 };
 
@@ -62,7 +76,7 @@ const WATCH_NEW_FILE_DEBOUNCE_MS = 1600;
 
 type ToastTone = "info" | "success" | "warning" | "error";
 type WatchScanReason = "focus" | "timer" | "new-file" | "manual" | "enabled";
-type StatusSort = "none" | "asc" | "desc";
+type AppView = "workbench" | "watch-folders";
 
 type ToastMessage = {
   id: number;
@@ -85,8 +99,10 @@ function App() {
   const [isPauseRequested, setIsPauseRequested] = useState(false);
   const [isRefreshingUsage, setIsRefreshingUsage] = useState(false);
   const [isWatchScanning, setIsWatchScanning] = useState(false);
-  const [watchLastScanAt, setWatchLastScanAt] = useState<string | null>(null);
-  const [statusSort, setStatusSort] = useState<StatusSort>("none");
+  const [watchScans, setWatchScans] = useState<Record<string, WatchFolderScan & { lastScannedAt: string; lastError?: string | null }>>({});
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("default");
+  const [view, setView] = useState<AppView>("workbench");
+  const [activeWatchFolderId, setActiveWatchFolderId] = useState<string | null>(null);
   const [notice, setNotice] = useState("选择文件或文件夹后开始压缩。已写入埋点的图片会自动跳过。");
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const pauseRef = useRef(false);
@@ -102,19 +118,38 @@ function App() {
   const activeProviderRef = useRef<Provider>("Compresto");
   const watchScanTimerRef = useRef<number | null>(null);
   const watchScanInFlightRef = useRef(false);
+  const pendingWatchScanFoldersRef = useRef<Set<string> | null>(null);
   const autoRunAfterCurrentBatchRef = useRef(false);
+  const currentRunSourceRef = useRef<"manual" | "watch" | null>(null);
+  const activeCompressionRunIdRef = useRef<string | null>(null);
+  const stopRequestedRef = useRef(false);
 
+  const activeWatchFolder = useMemo(
+    () => watchFoldersFromConfig(config).find((folder) => folder.id === activeWatchFolderId) ?? null,
+    [activeWatchFolderId, config],
+  );
+  const visibleQueue = useMemo(
+    () => (activeWatchFolder ? queue.filter((item) => isPathInFolder(item.path, activeWatchFolder.path)) : queue),
+    [activeWatchFolder, queue],
+  );
   const stats = useMemo(() => {
-    const original = totalBytes(queue, "size");
-    const compressed = totalBytes(queue, "compressedSize");
-    const done = queue.filter((item) => item.status === "done").length;
-    const failed = queue.filter((item) => item.status === "failed").length;
-    const already = queue.filter((item) => item.isCompressed).length;
-    const selected = queue.filter((item) => item.selected).length;
+    const original = totalBytes(visibleQueue, "size");
+    const compressed = totalBytes(visibleQueue, "compressedSize");
+    const done = visibleQueue.filter((item) => item.status === "done").length;
+    const failed = visibleQueue.filter((item) => item.status === "failed").length;
+    const already = visibleQueue.filter((item) => item.isCompressed).length;
+    const selected = visibleQueue.filter((item) => item.selected).length;
     return { original, compressed, done, failed, already, selected };
-  }, [queue]);
+  }, [visibleQueue]);
 
-  const displayQueue = useMemo(() => sortQueueByStatus(queue, statusSort), [queue, statusSort]);
+  const displayQueue = useMemo(
+    () => prioritizeQueueByStatus(visibleQueue, statusFilter),
+    [visibleQueue, statusFilter],
+  );
+  const watchFolderSummaries = useMemo(
+    () => buildWatchFolderSummaries(config, watchScans, queue),
+    [config, queue, watchScans],
+  );
 
   useEffect(() => {
     void loadConfig();
@@ -124,8 +159,9 @@ function App() {
         void addPaths(payload.paths);
       }
     });
-    const unlistenWatch = listen("watch-folder-changed", () => {
-      scheduleWatchScan("new-file", WATCH_NEW_FILE_DEBOUNCE_MS);
+    const unlistenWatch = listen("watch-folder-changed", (event) => {
+      const payload = event.payload as { folder?: string };
+      scheduleWatchScan("new-file", WATCH_NEW_FILE_DEBOUNCE_MS, payload.folder);
     });
     const intervalId = window.setInterval(() => {
       scheduleWatchScan("timer");
@@ -184,20 +220,20 @@ function App() {
   }, [activeProvider]);
 
   useEffect(() => {
-    const folder = config.watchFolderPath;
-    if (!config.watchFolderEnabled || !folder) {
+    const folders = enabledWatchFolders(config).map((folder) => folder.path);
+    if (!folders.length) {
       void invoke("stop_folder_watch");
       return;
     }
 
-    void invoke("start_folder_watch", { folder })
+    void invoke("start_folder_watch", { folders })
       .then(() => scheduleWatchScan("enabled", 250))
       .catch((error) => showToast(String(error), "error"));
 
     return () => {
       void invoke("stop_folder_watch");
     };
-  }, [config.watchFolderEnabled, config.watchFolderPath]);
+  }, [config.watchFolders, config.watchFolderEnabled, config.watchFolderPath]);
 
   function showToast(message: string, tone: ToastTone = "info") {
     if (toastTimerRef.current) {
@@ -254,7 +290,7 @@ function App() {
     const selected = await open({
       multiple: true,
       directory: false,
-      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "avif"] }],
+      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp"] }],
     });
     const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
     if (paths.length) void addPaths(paths);
@@ -274,25 +310,62 @@ function App() {
     }
   }
 
-  async function chooseWatchFolder() {
-    const selected = await open({ multiple: false, directory: true });
-    if (typeof selected === "string") {
-      updateWatchConfig({ watchFolderPath: selected, watchFolderEnabled: true }, "监听文件夹已启用。");
-    }
-  }
+  async function chooseWatchFolders() {
+    const selected = await open({ multiple: true, directory: true });
+    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    if (!paths.length) return;
 
-  function updateWatchConfig(patch: Partial<Pick<AppConfig, "watchFolderEnabled" | "watchFolderPath">>, message: string) {
-    const nextConfig = { ...configRef.current, ...patch };
-    persistKeyChange(nextConfig, message);
-  }
+    const current = watchFoldersFromConfig(configRef.current);
+    const existingPaths = new Set(current.map((folder) => normalizePathForCompare(folder.path)));
+    const additions = paths
+      .filter((path) => !existingPaths.has(normalizePathForCompare(path)))
+      .map((path) => createWatchFolder(path));
 
-  function toggleWatchFolder(enabled: boolean) {
-    const folder = configRef.current.watchFolderPath;
-    if (enabled && !folder) {
-      showToast("请先选择要监听的文件夹。", "warning");
+    if (!additions.length) {
+      showToast("这些文件夹已经在监听列表中。", "warning");
       return;
     }
-    updateWatchConfig({ watchFolderEnabled: enabled }, enabled ? "监听文件夹已启用。" : "监听文件夹已停用。");
+
+    const nextFolders = [...current, ...additions];
+    persistWatchFolders(nextFolders, `已添加 ${additions.length} 个监听文件夹。`);
+    setView("watch-folders");
+    setTimeout(() => scanWatchedFolders("manual", additions.map((folder) => folder.path)), 0);
+  }
+
+  function persistWatchFolders(folders: WatchFolderConfig[], message: string) {
+    persistKeyChange(configWithWatchFolders(configRef.current, folders), message);
+  }
+
+  function toggleWatchFolder(id: string, enabled: boolean) {
+    const folders = watchFoldersFromConfig(configRef.current).map((folder) =>
+      folder.id === id ? { ...folder, enabled } : folder,
+    );
+    persistWatchFolders(folders, enabled ? "监听文件夹已启用。" : "监听文件夹已暂停。");
+    stopWatchRunIfNoEnabledFolders(folders);
+  }
+
+  function removeWatchFolder(id: string) {
+    const folder = watchFoldersFromConfig(configRef.current).find((candidate) => candidate.id === id);
+    const folders = watchFoldersFromConfig(configRef.current).filter((candidate) => candidate.id !== id);
+    persistWatchFolders(folders, "监听文件夹已移除。");
+    setWatchScans((current) => {
+      if (!folder) return current;
+      const next = { ...current };
+      delete next[folder.path];
+      return next;
+    });
+    if (activeWatchFolderId === id) {
+      setActiveWatchFolderId(null);
+    }
+    stopWatchRunIfNoEnabledFolders(folders);
+  }
+
+  function openWatchFolderDetail(id: string) {
+    const folder = watchFoldersFromConfig(configRef.current).find((candidate) => candidate.id === id);
+    if (!folder) return;
+    setActiveWatchFolderId(id);
+    setView("workbench");
+    void scanWatchedFolders("manual", [folder.path]);
   }
 
   function toggleKeepAwake(enabled: boolean) {
@@ -337,20 +410,36 @@ function App() {
     }
   }
 
-  function scheduleWatchScan(reason: WatchScanReason, delay = 0) {
+  function scheduleWatchScan(reason: WatchScanReason, delay = 0, folder?: string) {
+    if (folder) {
+      if (!pendingWatchScanFoldersRef.current) {
+        pendingWatchScanFoldersRef.current = new Set();
+      }
+      pendingWatchScanFoldersRef.current.add(folder);
+    } else {
+      pendingWatchScanFoldersRef.current = null;
+    }
     if (watchScanTimerRef.current) {
       window.clearTimeout(watchScanTimerRef.current);
     }
     watchScanTimerRef.current = window.setTimeout(() => {
       watchScanTimerRef.current = null;
-      void scanWatchedFolder(reason);
+      const pending = pendingWatchScanFoldersRef.current;
+      pendingWatchScanFoldersRef.current = null;
+      void scanWatchedFolders(reason, pending ? [...pending] : undefined);
     }, delay);
   }
 
-  async function scanWatchedFolder(reason: WatchScanReason) {
+  async function scanWatchedFolders(reason: WatchScanReason, folderPaths?: string[]) {
     const currentConfig = configRef.current;
-    const folder = currentConfig.watchFolderPath;
-    if (!currentConfig.watchFolderEnabled || !folder) return;
+    const allFolders = enabledWatchFolders(currentConfig);
+    const selectedPaths = folderPaths?.length
+      ? new Set(folderPaths.map(normalizePathForCompare))
+      : null;
+    const folders = selectedPaths
+      ? allFolders.filter((folder) => selectedPaths.has(normalizePathForCompare(folder.path)))
+      : allFolders;
+    if (!folders.length) return;
 
     if (watchScanInFlightRef.current) {
       scheduleWatchScan(reason, WATCH_NEW_FILE_DEBOUNCE_MS);
@@ -360,21 +449,48 @@ function App() {
     watchScanInFlightRef.current = true;
     setIsWatchScanning(true);
     try {
-      const files = await invoke<ImageFile[]>("scan_folder", { folder, recursive: false });
-      const newItems = toQueueItems(files, queueRef.current);
-      if (newItems.length) {
-        updateQueue((current) => [...current, ...toQueueItems(files, current)]);
-      }
-      const watchedPaths = new Set(files.map((file) => file.path));
+      let totalFiles = 0;
+      let totalNewItems = 0;
+      const runnablePaths = new Set<string>();
 
-      const checkedAt = new Date().toISOString();
-      setWatchLastScanAt(checkedAt);
+      for (const folder of folders) {
+        try {
+          const scan = await invoke<WatchFolderScan>("scan_watch_folder", { folder: folder.path });
+          const checkedAt = new Date().toISOString();
+          totalFiles += scan.files.length;
+          scan.files.forEach((file) => runnablePaths.add(file.path));
+          const newItems = toQueueItems(scan.files, queueRef.current);
+          totalNewItems += newItems.length;
+          if (newItems.length) {
+            updateQueue((current) => [...current, ...toQueueItems(scan.files, current)]);
+          }
+          setWatchScans((current) => ({
+            ...current,
+            [folder.path]: { ...scan, lastScannedAt: checkedAt, lastError: null },
+          }));
+        } catch (error) {
+          setWatchScans((current) => ({
+            ...current,
+            [folder.path]: {
+              folder: folder.path,
+              allFiles: 0,
+              supportedFiles: 0,
+              compressedFiles: 0,
+              uncompressedFiles: 0,
+              files: [],
+              lastScannedAt: new Date().toISOString(),
+              lastError: String(error),
+            },
+          }));
+          showToast(`${folderName(folder.path)} 扫描失败：${String(error)}`, "error");
+        }
+      }
       if (reason === "manual") {
-        showToast(newItems.length ? `发现 ${newItems.length} 个新图片。` : "监听文件夹没有新图片。", "info");
+        showToast(totalNewItems ? `发现 ${totalNewItems} 个新图片。` : "监听文件夹没有新图片。", "info");
       }
-      setNotice(`监听文件夹已扫描：${files.length} 个当前层级图片。`);
+      setNotice(`监听文件夹已扫描：${folders.length} 个目录，${totalFiles} 个当前层级图片。`);
 
-      const runnable = runnableItems(queueRef.current).filter((item) => watchedPaths.has(item.path));
+      const runnable = runnableItems(queueRef.current).filter((item) => runnablePaths.has(item.path));
       if (!runnable.length) return;
       if (outputPolicyRef.current === "Overwrite") {
         showToast("监听自动压缩不会执行覆盖源文件。请改为 compressed/ 或自定义输出目录。", "warning");
@@ -395,7 +511,7 @@ function App() {
   }
 
   async function startCompression() {
-    const runnable = runnableItems(queueRef.current);
+    const runnable = runnableItems(activeWatchFolder ? queueRef.current.filter((item) => isPathInFolder(item.path, activeWatchFolder.path)) : queueRef.current);
     if (!runnable.length) {
       showToast(queueRef.current.length ? "当前没有可压缩的图片。已压缩文件会被自动跳过。" : "请先选择文件或文件夹。", "warning");
       return;
@@ -425,8 +541,12 @@ function App() {
     }
 
     pauseRef.current = false;
+    stopRequestedRef.current = false;
     setIsPauseRequested(false);
     isRunningRef.current = true;
+    currentRunSourceRef.current = source;
+    const runId = `run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    activeCompressionRunIdRef.current = runId;
     setIsRunning(true);
     await configSaveRef.current;
     const keepAwakeStarted = await beginKeepAwakeIfNeeded();
@@ -438,6 +558,9 @@ function App() {
       let nextIndex = 0;
 
       async function processItem(item: QueueItem) {
+        if (source === "watch" && !isItemInEnabledWatchFolders(item, configRef.current)) {
+          return;
+        }
         await configSaveRef.current;
         const currentConfig = configRef.current;
         const itemProvider = activeProviderRef.current;
@@ -464,10 +587,20 @@ function App() {
             path: item.path,
             provider: itemProvider,
             keyId: itemKeyId,
+            runId,
             options: normalizeOptions(optionsRef.current),
             outputPolicy: outputPolicyRef.current,
             customOutputDir: customOutputDirRef.current || null,
           });
+
+          if (stopRequestedRef.current) {
+            updateQueue((current) =>
+              current.map((candidate) =>
+                candidate.id === item.id ? { ...candidate, status: "cancelled", error: "已停止" } : candidate,
+              ),
+            );
+            return;
+          }
 
           updateQueue((current) =>
             current.map((candidate) =>
@@ -498,7 +631,11 @@ function App() {
         } catch (error) {
           updateQueue((current) =>
             current.map((candidate) =>
-              candidate.id === item.id ? { ...candidate, status: "failed", error: String(error) } : candidate,
+              candidate.id === item.id
+                ? stopRequestedRef.current
+                  ? { ...candidate, status: "cancelled", error: "已停止" }
+                  : { ...candidate, status: "failed", error: String(error) }
+                : candidate,
             ),
           );
         }
@@ -509,6 +646,9 @@ function App() {
           const item = runnable[nextIndex];
           nextIndex += 1;
           if (!item) return;
+          if (source === "watch" && !isItemInEnabledWatchFolders(item, configRef.current)) {
+            continue;
+          }
           await processItem(item);
         }
       }
@@ -517,15 +657,26 @@ function App() {
       await Promise.all(Array.from({ length: workerCount }, () => worker()));
     } finally {
       await endKeepAwakeIfNeeded(keepAwakeStarted);
+      await clearCompressionRun(runId);
     }
 
     isRunningRef.current = false;
+    currentRunSourceRef.current = null;
+    activeCompressionRunIdRef.current = null;
     setIsRunning(false);
     setIsPauseRequested(false);
-    setNotice(pauseRef.current ? "已暂停。再次开始会继续处理未完成文件。" : "处理完成。");
+    setNotice(
+      stopRequestedRef.current
+        ? "已停止。正在压缩的结果已丢弃。"
+        : pauseRef.current
+          ? "已暂停。再次开始会继续处理未完成文件。"
+          : "处理完成。",
+    );
     if (!pauseRef.current && autoRunAfterCurrentBatchRef.current) {
       autoRunAfterCurrentBatchRef.current = false;
-      const pending = runnableItems(queueRef.current);
+      const pending = runnableItems(queueRef.current).filter((item) =>
+        isItemInEnabledWatchFolders(item, configRef.current),
+      );
       if (pending.length) {
         void runCompression(pending, "watch");
       }
@@ -556,6 +707,41 @@ function App() {
     pauseRef.current = true;
     setIsPauseRequested(true);
     setNotice("暂停请求已收到，当前文件完成后会停止。");
+  }
+
+  function requestImmediateStop() {
+    if (!isRunningRef.current) return;
+    stopRequestedRef.current = true;
+    pauseRef.current = true;
+    autoRunAfterCurrentBatchRef.current = false;
+    setIsPauseRequested(true);
+    setNotice("正在立即停止，当前压缩结果会被丢弃。");
+    updateQueue((current) =>
+      current.map((item) =>
+        item.status === "processing" ? { ...item, status: "cancelled", error: "已停止" } : item,
+      ),
+    );
+    const runId = activeCompressionRunIdRef.current;
+    if (runId) {
+      void invoke("cancel_compression_run", { runId }).catch((error) => showToast(String(error), "error"));
+    }
+  }
+
+  async function clearCompressionRun(runId: string) {
+    try {
+      await invoke("clear_compression_run", { runId });
+    } catch {
+      // Best effort cleanup; stale run ids only affect future runs if ids collide.
+    }
+  }
+
+  function stopWatchRunIfNoEnabledFolders(folders: WatchFolderConfig[]) {
+    if (currentRunSourceRef.current === "watch" && !folders.some((folder) => folder.enabled)) {
+      pauseRef.current = true;
+      autoRunAfterCurrentBatchRef.current = false;
+      setIsPauseRequested(true);
+      setNotice("监听已暂停，当前正在上传的图片完成后会停止。");
+    }
   }
 
   function persistKeyChange(nextConfig: AppConfig, message: string) {
@@ -589,12 +775,16 @@ function App() {
   }
 
   function toggleAllSelected() {
-    const shouldSelect = stats.selected !== queue.length;
-    updateQueue((current) => current.map((item) => ({ ...item, selected: shouldSelect })));
+    const visibleIds = new Set(visibleQueue.map((item) => item.id));
+    const shouldSelect = stats.selected !== visibleQueue.length;
+    updateQueue((current) =>
+      current.map((item) => (visibleIds.has(item.id) ? { ...item, selected: shouldSelect } : item)),
+    );
   }
 
   function removeSelected() {
-    updateQueue((current) => current.filter((item) => !item.selected));
+    const visibleIds = new Set(visibleQueue.map((item) => item.id));
+    updateQueue((current) => current.filter((item) => !(visibleIds.has(item.id) && item.selected)));
   }
 
   function removeOne(id: string) {
@@ -606,8 +796,103 @@ function App() {
     setActiveProvider(provider);
   }
 
-  function toggleStatusSort() {
-    setStatusSort((current) => (current === "none" ? "asc" : current === "asc" ? "desc" : "none"));
+  function renderSettingsPane(showRunBar: boolean) {
+    return (
+      <aside className="settings-pane">
+        <div className="tabs">
+          <button
+            type="button"
+            className={activeProvider === "Compresto" ? "active" : ""}
+            onClick={() => selectProvider("Compresto")}
+          >
+            Compresto
+          </button>
+          <button
+            type="button"
+            className={activeProvider === "Tinify" ? "active" : ""}
+            onClick={() => selectProvider("Tinify")}
+          >
+            Tinify
+          </button>
+        </div>
+
+        {activeProvider === "Compresto" ? (
+          <ComprestoSettings
+            config={config}
+            persistKeyChange={persistKeyChange}
+            notify={showToast}
+            outputPolicy={outputPolicy}
+            setOutputPolicy={setOutputPolicy}
+            chooseOutputDir={chooseOutputDir}
+            customOutputDir={customOutputDir}
+            toggleKeepAwake={toggleKeepAwake}
+            usage={usage.Compresto}
+            refreshUsage={() => refreshUsage("Compresto")}
+            loading={isRefreshingUsage}
+          />
+        ) : (
+          <TinifySettings
+            config={config}
+            persistKeyChange={persistKeyChange}
+            notify={showToast}
+            options={options}
+            setOptions={setOptions}
+            outputPolicy={outputPolicy}
+            setOutputPolicy={setOutputPolicy}
+            chooseOutputDir={chooseOutputDir}
+            customOutputDir={customOutputDir}
+            toggleKeepAwake={toggleKeepAwake}
+            usage={usage.Tinify}
+            refreshUsage={() => refreshUsage("Tinify")}
+            loading={isRefreshingUsage}
+          />
+        )}
+
+        {showRunBar ? (
+          <footer className="run-bar">
+            <button type="button" className="primary" onClick={startCompression} disabled={isRunning}>
+              {isRunning ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+              开始
+            </button>
+            <button type="button" onClick={requestPause} disabled={!isRunning || isPauseRequested}>
+              <Pause size={18} />
+              {isPauseRequested ? "暂停中" : "暂停"}
+            </button>
+            <button type="button" className="danger" onClick={requestImmediateStop} disabled={!isRunning}>
+              <Square size={17} />
+              立即停止
+            </button>
+          </footer>
+        ) : null}
+      </aside>
+    );
+  }
+
+  if (view === "watch-folders") {
+    return (
+      <>
+        <WatchFoldersPage
+          summaries={watchFolderSummaries}
+          isScanning={isWatchScanning}
+          addFolders={chooseWatchFolders}
+          scanAll={() => scanWatchedFolders("manual")}
+          openFolder={openWatchFolderDetail}
+          toggleFolder={toggleWatchFolder}
+          removeFolder={removeWatchFolder}
+          setAllEnabled={(enabled) => {
+            const folders = watchFoldersFromConfig(configRef.current).map((folder) => ({ ...folder, enabled }));
+            persistWatchFolders(folders, enabled ? "全部监听文件夹已启用。" : "全部监听文件夹已暂停。");
+            stopWatchRunIfNoEnabledFolders(folders);
+          }}
+          backToWorkbench={() => {
+            setActiveWatchFolderId(null);
+            setView("workbench");
+          }}
+          settingsPane={renderSettingsPane(false)}
+        />
+        <Toast toast={toast} onClose={() => setToast(null)} />
+      </>
+    );
   }
 
   return (
@@ -616,13 +901,29 @@ function App() {
       <section className="file-pane">
         <header className="file-toolbar">
           <div className="brand-lockup">
-            <div className="brand-sigil">TI</div>
+            <div className="brand-sigil">
+              <img src={appIcon} alt="" />
+            </div>
             <div>
               <h1>Tiny Image Tool</h1>
-              <p>{notice}</p>
+              {activeWatchFolder ? (
+                <div className="breadcrumb" aria-label="当前位置">
+                  <button type="button" onClick={() => setView("watch-folders")}>
+                    监听文件夹
+                  </button>
+                  <ChevronRight size={14} />
+                  <span>{folderName(activeWatchFolder.path)}</span>
+                </div>
+              ) : (
+                <p>{notice}</p>
+              )}
             </div>
           </div>
           <div className="toolbar-actions">
+            <button type="button" onClick={() => setView("watch-folders")}>
+              <ListTree size={17} />
+              监听文件夹
+            </button>
             <button type="button" onClick={chooseFiles}>
               <FileImage size={17} />
               选择文件
@@ -639,7 +940,7 @@ function App() {
         </header>
 
         <section className="summary-strip">
-          <Metric label="文件" value={String(queue.length)} detail={`${stats.selected} 已选`} />
+          <Metric label="文件" value={String(visibleQueue.length)} detail={`${stats.selected} 已选`} />
           <Metric label="已压缩" value={String(stats.already)} detail="埋点命中" />
           <Metric label="完成" value={String(stats.done)} detail={`${stats.failed} failed`} />
           <Metric label="原始大小" value={formatBytes(stats.original)} detail={formatBytes(stats.compressed)} />
@@ -650,21 +951,22 @@ function App() {
             <label className="select-all">
               <input
                 type="checkbox"
-                checked={queue.length > 0 && stats.selected === queue.length}
+                checked={visibleQueue.length > 0 && stats.selected === visibleQueue.length}
                 onChange={toggleAllSelected}
               />
               资产
             </label>
-            <button
-              type="button"
-              className={statusSort === "none" ? "sort-head" : "sort-head active"}
-              onClick={toggleStatusSort}
-              title="按状态排序"
-            >
+            <label className="status-filter">
               状态
-              <ArrowDownUp size={13} />
-              {statusSort !== "none" ? <small>{statusSort === "asc" ? "升" : "降"}</small> : null}
-            </button>
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}>
+                <option value="default">默认</option>
+                <option value="queued">待处理</option>
+                <option value="processing">处理中</option>
+                <option value="failed">失败</option>
+                <option value="done">已压缩</option>
+                <option value="cancelled">已取消</option>
+              </select>
+            </label>
             <span>大小</span>
             <span>操作</span>
           </div>
@@ -701,84 +1003,156 @@ function App() {
         </section>
       </section>
 
-      <aside className="settings-pane">
-        <div className="tabs">
-          <button
-            type="button"
-            className={activeProvider === "Compresto" ? "active" : ""}
-            onClick={() => selectProvider("Compresto")}
-          >
-            Compresto
-          </button>
-          <button
-            type="button"
-            className={activeProvider === "Tinify" ? "active" : ""}
-            onClick={() => selectProvider("Tinify")}
-          >
-            Tinify
-          </button>
-        </div>
-
-        {activeProvider === "Compresto" ? (
-          <ComprestoSettings
-            config={config}
-            setConfig={setConfig}
-            saveConfig={saveConfig}
-          persistKeyChange={persistKeyChange}
-          notify={showToast}
-            outputPolicy={outputPolicy}
-            setOutputPolicy={setOutputPolicy}
-            chooseOutputDir={chooseOutputDir}
-            customOutputDir={customOutputDir}
-            toggleKeepAwake={toggleKeepAwake}
-            chooseWatchFolder={chooseWatchFolder}
-            toggleWatchFolder={toggleWatchFolder}
-            scanWatchFolder={() => scanWatchedFolder("manual")}
-            isWatchScanning={isWatchScanning}
-            watchLastScanAt={watchLastScanAt}
-            usage={usage.Compresto}
-            refreshUsage={() => refreshUsage("Compresto")}
-            loading={isRefreshingUsage}
-          />
-        ) : (
-          <TinifySettings
-            config={config}
-            setConfig={setConfig}
-            saveConfig={saveConfig}
-            persistKeyChange={persistKeyChange}
-            notify={showToast}
-            options={options}
-            setOptions={setOptions}
-            outputPolicy={outputPolicy}
-            setOutputPolicy={setOutputPolicy}
-            chooseOutputDir={chooseOutputDir}
-            customOutputDir={customOutputDir}
-            toggleKeepAwake={toggleKeepAwake}
-            chooseWatchFolder={chooseWatchFolder}
-            toggleWatchFolder={toggleWatchFolder}
-            scanWatchFolder={() => scanWatchedFolder("manual")}
-            isWatchScanning={isWatchScanning}
-            watchLastScanAt={watchLastScanAt}
-            usage={usage.Tinify}
-            refreshUsage={() => refreshUsage("Tinify")}
-            loading={isRefreshingUsage}
-          />
-        )}
-
-        <footer className="run-bar">
-          <button type="button" className="primary" onClick={startCompression} disabled={isRunning}>
-            {isRunning ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-            开始
-          </button>
-          <button type="button" onClick={requestPause} disabled={!isRunning || isPauseRequested}>
-            <Pause size={18} />
-            {isPauseRequested ? "暂停中" : "暂停"}
-          </button>
-        </footer>
-      </aside>
+      {renderSettingsPane(true)}
       </main>
       <Toast toast={toast} onClose={() => setToast(null)} />
     </>
+  );
+}
+
+function WatchFoldersPage({
+  summaries,
+  isScanning,
+  addFolders,
+  scanAll,
+  openFolder,
+  toggleFolder,
+  removeFolder,
+  setAllEnabled,
+  backToWorkbench,
+  settingsPane,
+}: {
+  summaries: WatchFolderSummary[];
+  isScanning: boolean;
+  addFolders: () => void;
+  scanAll: () => void;
+  openFolder: (id: string) => void;
+  toggleFolder: (id: string, enabled: boolean) => void;
+  removeFolder: (id: string) => void;
+  setAllEnabled: (enabled: boolean) => void;
+  backToWorkbench: () => void;
+  settingsPane: React.ReactNode;
+}) {
+  const totalPending = summaries.reduce((sum, folder) => sum + folder.uncompressedFiles, 0);
+  const totalProcessing = summaries.reduce((sum, folder) => sum + folder.processingFiles, 0);
+  const totalFailed = summaries.reduce((sum, folder) => sum + folder.failedFiles, 0);
+  const totalSupported = summaries.reduce((sum, folder) => sum + folder.supportedFiles, 0);
+  const totalCompressed = summaries.reduce((sum, folder) => sum + folder.compressedFiles, 0);
+  const totalFiles = summaries.reduce((sum, folder) => sum + folder.allFiles, 0);
+  const enabledCount = summaries.filter((folder) => folder.enabled).length;
+
+  return (
+    <main className="watch-shell">
+      <section className="watch-page">
+        <header className="watch-page-header">
+          <div className="brand-lockup">
+            <div className="brand-sigil">
+              <img src={appIcon} alt="" />
+            </div>
+            <div>
+              <h1>监听文件夹</h1>
+              <p>自动扫描当前层级图片，使用右侧当前服务商和 API Key。</p>
+            </div>
+          </div>
+          <div className="toolbar-actions">
+            <button type="button" onClick={backToWorkbench}>
+              返回工作台
+            </button>
+            <button type="button" onClick={addFolders}>
+              <FolderOpen size={17} />
+              添加文件夹
+            </button>
+            <button type="button" className="refresh-button" onClick={scanAll} disabled={!enabledCount || isScanning}>
+              {isScanning ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />}
+              扫描全部
+            </button>
+            <button type="button" className="ghost" onClick={() => setAllEnabled(enabledCount !== summaries.length)}>
+              {enabledCount === summaries.length && summaries.length ? "暂停全部" : "恢复全部"}
+            </button>
+          </div>
+        </header>
+
+        <section className="watch-summary-grid">
+          <Metric label="监听中" value={String(enabledCount)} detail={`${summaries.length} folders`} />
+          <Metric label="待压缩" value={String(totalPending)} detail="未压缩图片" />
+          <Metric label="正在压缩" value={String(totalProcessing)} detail="全局并行队列" />
+          <Metric label="失败" value={String(totalFailed)} detail="最近任务" />
+        </section>
+
+        <details className="watch-extra-stats">
+          <summary>
+            更多统计：所有文件 {totalFiles} · 支持格式 {totalSupported} · 已压缩 {totalCompressed} · 文件夹 {summaries.length}
+          </summary>
+          <div className="watch-summary-grid compact">
+            <Metric label="文件夹" value={String(summaries.length)} detail={`${enabledCount} enabled`} />
+            <Metric label="所有文件" value={String(totalFiles)} detail="当前层级" />
+            <Metric label="支持格式" value={String(totalSupported)} detail="jpg/png/webp" />
+            <Metric label="已压缩" value={String(totalCompressed)} detail="埋点或输出命中" />
+          </div>
+        </details>
+
+        <section className="watch-table">
+          <div className="watch-table-scroll">
+            <div className="watch-table-head">
+              <span>文件夹</span>
+              <span>状态</span>
+              <span>所有</span>
+              <span>未压缩</span>
+              <span>已压缩</span>
+              <span>处理中</span>
+              <span>失败</span>
+              <span className="watch-sticky-col">操作</span>
+            </div>
+            {summaries.length === 0 ? (
+              <div className="empty-state">
+                <FolderOpen size={30} />
+                <span>还没有监听文件夹</span>
+                <button type="button" onClick={addFolders}>
+                  <Plus size={16} />
+                  添加文件夹
+                </button>
+              </div>
+            ) : (
+              summaries.map((folder) => (
+                <div className="watch-folder-row" key={folder.id}>
+                  <button type="button" className="watch-folder-main" onClick={() => openFolder(folder.id)}>
+                    <FolderOpen size={18} />
+                    <span>
+                      <strong>{folderName(folder.path)}</strong>
+                      <small>{folder.path}</small>
+                      <small>
+                        最近扫描：{folder.lastScannedAt ? formatDateTime(folder.lastScannedAt) : "Never"}
+                        {folder.lastError ? ` · ${folder.lastError}` : ""}
+                      </small>
+                    </span>
+                  </button>
+                  <span className={folder.enabled ? "watch-state active" : "watch-state"}>
+                    {folder.enabled ? "监听中" : "已暂停"}
+                  </span>
+                  <b>{folder.allFiles}</b>
+                  <b>{folder.uncompressedFiles}</b>
+                  <b>{folder.compressedFiles}</b>
+                  <b>{folder.processingFiles}</b>
+                  <b>{folder.failedFiles}</b>
+                  <div className="watch-row-actions watch-sticky-col">
+                    <button className="icon" type="button" title="进入" onClick={() => openFolder(folder.id)}>
+                      <ChevronRight size={16} />
+                    </button>
+                    <button className="icon" type="button" title={folder.enabled ? "暂停" : "恢复"} onClick={() => toggleFolder(folder.id, !folder.enabled)}>
+                      {folder.enabled ? <Pause size={16} /> : <Play size={16} />}
+                    </button>
+                    <button className="icon" type="button" title="移除" onClick={() => removeFolder(folder.id)}>
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+      </section>
+      {settingsPane}
+    </main>
   );
 }
 
@@ -791,11 +1165,6 @@ function ComprestoSettings({
   chooseOutputDir,
   customOutputDir,
   toggleKeepAwake,
-  chooseWatchFolder,
-  toggleWatchFolder,
-  scanWatchFolder,
-  isWatchScanning,
-  watchLastScanAt,
   usage,
   refreshUsage,
   loading,
@@ -806,14 +1175,6 @@ function ComprestoSettings({
         <ApiKeyManager provider="Compresto" config={config} persistKeyChange={persistKeyChange} notify={notify} />
       </Panel>
       <OutputPanel {...{ config, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir, toggleKeepAwake }} />
-      <WatchFolderPanel
-        config={config}
-        chooseWatchFolder={chooseWatchFolder}
-        toggleWatchFolder={toggleWatchFolder}
-        scanWatchFolder={scanWatchFolder}
-        isWatchScanning={isWatchScanning}
-        watchLastScanAt={watchLastScanAt}
-      />
       <UsagePanel provider="Compresto" result={usage} onRefresh={refreshUsage} loading={loading} />
     </div>
   );
@@ -830,11 +1191,6 @@ function TinifySettings({
   chooseOutputDir,
   customOutputDir,
   toggleKeepAwake,
-  chooseWatchFolder,
-  toggleWatchFolder,
-  scanWatchFolder,
-  isWatchScanning,
-  watchLastScanAt,
   usage,
   refreshUsage,
   loading,
@@ -856,7 +1212,6 @@ function TinifySettings({
             <option value="jpg">JPG</option>
             <option value="png">PNG</option>
             <option value="webp">WebP</option>
-            <option value="avif">AVIF</option>
           </select>
         </label>
         <div className="split">
@@ -900,14 +1255,6 @@ function TinifySettings({
       </Panel>
 
       <OutputPanel {...{ config, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir, toggleKeepAwake }} />
-      <WatchFolderPanel
-        config={config}
-        chooseWatchFolder={chooseWatchFolder}
-        toggleWatchFolder={toggleWatchFolder}
-        scanWatchFolder={scanWatchFolder}
-        isWatchScanning={isWatchScanning}
-        watchLastScanAt={watchLastScanAt}
-      />
       <UsagePanel provider="Tinify" result={usage} onRefresh={refreshUsage} loading={loading} />
     </div>
   );
@@ -915,8 +1262,6 @@ function TinifySettings({
 
 type SettingsProps = {
   config: AppConfig;
-  setConfig: (config: AppConfig) => void;
-  saveConfig: () => void;
   persistKeyChange: (config: AppConfig, message: string) => void;
   notify: (message: string, tone?: ToastTone) => void;
   outputPolicy: OutputPolicy;
@@ -924,11 +1269,6 @@ type SettingsProps = {
   chooseOutputDir: () => void;
   customOutputDir: string;
   toggleKeepAwake: (enabled: boolean) => void;
-  chooseWatchFolder: () => void;
-  toggleWatchFolder: (enabled: boolean) => void;
-  scanWatchFolder: () => void;
-  isWatchScanning: boolean;
-  watchLastScanAt: string | null;
   usage: UsageResult | null;
   refreshUsage: () => void;
   loading: boolean;
@@ -1082,55 +1422,6 @@ function OutputPanel({
         />
         压缩时保持设备唤醒
       </label>
-    </Panel>
-  );
-}
-
-function WatchFolderPanel({
-  config,
-  chooseWatchFolder,
-  toggleWatchFolder,
-  scanWatchFolder,
-  isWatchScanning,
-  watchLastScanAt,
-}: {
-  config: AppConfig;
-  chooseWatchFolder: () => void;
-  toggleWatchFolder: (enabled: boolean) => void;
-  scanWatchFolder: () => void;
-  isWatchScanning: boolean;
-  watchLastScanAt: string | null;
-}) {
-  return (
-    <Panel title="文件夹监听" icon={<FolderOpen size={18} />}>
-      <label className="check-row">
-        <input
-          type="checkbox"
-          checked={config.watchFolderEnabled}
-          onChange={(event) => toggleWatchFolder(event.target.checked)}
-        />
-        自动扫描并压缩当前文件夹图片
-      </label>
-      <button className="ghost" type="button" onClick={chooseWatchFolder}>
-        <FolderOpen size={16} />
-        选择监听文件夹
-      </button>
-      <p className="hint">{config.watchFolderPath || "尚未选择文件夹"}</p>
-      <div className="watch-actions">
-        <button
-          type="button"
-          className="refresh-button"
-          onClick={scanWatchFolder}
-          disabled={!config.watchFolderEnabled || !config.watchFolderPath || isWatchScanning}
-        >
-          {isWatchScanning ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />}
-          立即扫描
-        </button>
-        <span className={config.watchFolderEnabled ? "watch-state active" : "watch-state"}>
-          {config.watchFolderEnabled ? "监听中" : "已停用"}
-        </span>
-      </div>
-      <p className="hint">最近扫描：{watchLastScanAt ? formatDateTime(watchLastScanAt) : "Never"}</p>
     </Panel>
   );
 }
@@ -1302,23 +1593,6 @@ function runnableItems(items: QueueItem[]): QueueItem[] {
   );
 }
 
-function sortQueueByStatus(items: QueueItem[], sort: StatusSort): QueueItem[] {
-  if (sort === "none") return items;
-  const direction = sort === "asc" ? 1 : -1;
-  return [...items].sort((a, b) => {
-    const statusDelta = statusRank(a) - statusRank(b);
-    if (statusDelta !== 0) return statusDelta * direction;
-    return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
-  });
-}
-
-function statusRank(item: QueueItem): number {
-  if (item.isCompressed || item.status === "done") return 3;
-  if (item.status === "processing") return 1;
-  if (item.status === "failed") return 2;
-  return 0;
-}
-
 function providerKeys(config: AppConfig, provider: Provider): ApiKeyEntry[] {
   return provider === "Compresto" ? config.comprestoKeys ?? [] : config.tinifyKeys ?? [];
 }
@@ -1420,6 +1694,96 @@ function usageFromActiveKey(provider: Provider, config: AppConfig): UsageResult 
     lastCheckedAt: entry.lastCheckedAt ?? new Date().toISOString(),
     message: "Loaded from saved API key usage",
   };
+}
+
+function watchFoldersFromConfig(config: AppConfig): WatchFolderConfig[] {
+  if (config.watchFolders?.length) return config.watchFolders;
+  if (!config.watchFolderPath) return [];
+  return [
+    {
+      id: `watch-${config.watchFolderPath}`,
+      path: config.watchFolderPath,
+      enabled: config.watchFolderEnabled,
+      lastScannedAt: null,
+      lastError: null,
+    },
+  ];
+}
+
+function enabledWatchFolders(config: AppConfig): WatchFolderConfig[] {
+  return watchFoldersFromConfig(config).filter((folder) => folder.enabled);
+}
+
+function isItemInEnabledWatchFolders(item: QueueItem, config: AppConfig): boolean {
+  return enabledWatchFolders(config).some((folder) => isPathInFolder(item.path, folder.path));
+}
+
+function configWithWatchFolders(config: AppConfig, folders: WatchFolderConfig[]): AppConfig {
+  const firstFolder = folders[0] ?? null;
+  return {
+    ...config,
+    watchFolders: folders,
+    watchFolderPath: firstFolder?.path ?? null,
+    watchFolderEnabled: folders.some((folder) => folder.enabled),
+  };
+}
+
+function createWatchFolder(path: string): WatchFolderConfig {
+  return {
+    id: `watch-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    path,
+    enabled: true,
+    lastScannedAt: null,
+    lastError: null,
+  };
+}
+
+function buildWatchFolderSummaries(
+  config: AppConfig,
+  scans: Record<string, WatchFolderScan & { lastScannedAt: string; lastError?: string | null }>,
+  queue: QueueItem[],
+): WatchFolderSummary[] {
+  return watchFoldersFromConfig(config).map((folder) => {
+    const scan = scans[folder.path];
+    const folderQueue = queue.filter((item) => isPathInFolder(item.path, folder.path));
+    const queueByPath = new Map(folderQueue.map((item) => [item.path, item]));
+    const scannedFiles = scan?.files ?? [];
+    const compressedFiles =
+      scannedFiles.length > 0
+        ? scannedFiles.filter((file) => {
+            const queued = queueByPath.get(file.path);
+            return file.isCompressed || queued?.isCompressed || queued?.status === "done";
+          }).length
+        : folderQueue.filter((item) => item.isCompressed || item.status === "done").length;
+    const supportedFiles = scan?.supportedFiles ?? folderQueue.length;
+    return {
+      ...folder,
+      allFiles: scan?.allFiles ?? 0,
+      supportedFiles,
+      compressedFiles,
+      uncompressedFiles: Math.max(0, supportedFiles - compressedFiles),
+      processingFiles: folderQueue.filter((item) => item.status === "processing").length,
+      failedFiles: folderQueue.filter((item) => item.status === "failed").length,
+      queuedFiles: folderQueue.filter((item) => item.status === "queued").length,
+      lastScannedAt: scan?.lastScannedAt ?? folder.lastScannedAt ?? null,
+      lastError: scan?.lastError ?? folder.lastError ?? null,
+    };
+  });
+}
+
+function isPathInFolder(path: string, folder: string): boolean {
+  const normalizedFolder = normalizePathForCompare(folder).replace(/\/+$/, "");
+  const normalizedPath = normalizePathForCompare(path);
+  return normalizedPath.startsWith(`${normalizedFolder}/`);
+}
+
+function normalizePathForCompare(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function folderName(path: string): string {
+  const normalized = normalizePathForCompare(path);
+  return normalized.split("/").filter(Boolean).pop() || normalized || "Folder";
 }
 
 function formatKeyUsage(entry: ApiKeyEntry): string {

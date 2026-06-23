@@ -8,10 +8,10 @@ use walkdir::WalkDir;
 
 use crate::{
     metadata::{finalize_output_bytes, is_marked_compressed_path},
-    models::{CompressOptions, ImageFile, OutputPolicy},
+    models::{CompressOptions, ImageFile, OutputPolicy, WatchFolderScan},
 };
 
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "avif"];
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
 pub fn scan_image_paths(paths: Vec<String>) -> Result<Vec<ImageFile>, FileError> {
     let mut files = BTreeMap::new();
@@ -65,6 +65,38 @@ pub fn scan_image_folder(folder: String, recursive: bool) -> Result<Vec<ImageFil
     Ok(files.into_values().collect())
 }
 
+pub fn scan_watch_folder(folder: String) -> Result<WatchFolderScan, FileError> {
+    let path = PathBuf::from(&folder);
+    if !path.is_dir() {
+        return Err(FileError::InvalidSourcePath);
+    }
+
+    let canonical_folder = fs::canonicalize(&path)?;
+    let mut all_files = 0;
+    let mut files = BTreeMap::new();
+
+    for entry in fs::read_dir(&canonical_folder)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            all_files += 1;
+            add_image(&entry.path(), &mut files)?;
+        }
+    }
+
+    let image_files = files.into_values().collect::<Vec<_>>();
+    let compressed_files = image_files.iter().filter(|file| file.is_compressed).count();
+    let supported_files = image_files.len();
+
+    Ok(WatchFolderScan {
+        folder: canonical_folder.to_string_lossy().to_string(),
+        all_files,
+        supported_files,
+        compressed_files,
+        uncompressed_files: supported_files.saturating_sub(compressed_files),
+        files: image_files,
+    })
+}
+
 pub fn write_output_file(
     source_path: &str,
     bytes: &[u8],
@@ -108,10 +140,42 @@ fn add_image(path: &Path, files: &mut BTreeMap<String, ImageFile>) -> Result<(),
             name,
             extension,
             size: metadata.len(),
-            is_compressed: is_marked_compressed_path(&canonical)?,
+            is_compressed: is_marked_compressed_path(&canonical)?
+                || has_marked_output_in_compressed_folder(&canonical)?,
         },
     );
     Ok(())
+}
+
+fn has_marked_output_in_compressed_folder(source: &Path) -> Result<bool, FileError> {
+    if source
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| name == "compressed")
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    let Some(parent) = source.parent() else {
+        return Ok(false);
+    };
+    let Some(stem) = source.file_stem().and_then(|value| value.to_str()) else {
+        return Ok(false);
+    };
+    let compressed_dir = parent.join("compressed");
+    if !compressed_dir.is_dir() {
+        return Ok(false);
+    }
+
+    for extension in IMAGE_EXTENSIONS {
+        let candidate = compressed_dir.join(format!("{stem}.{extension}"));
+        if candidate.is_file() && is_marked_compressed_path(&candidate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -177,6 +241,7 @@ mod tests {
     fn filters_supported_extensions() {
         assert!(is_supported_image(Path::new("a.JPG")));
         assert!(is_supported_image(Path::new("a.webp")));
+        assert!(!is_supported_image(Path::new("a.avif")));
         assert!(!is_supported_image(Path::new("a.gif")));
     }
 
@@ -207,5 +272,57 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "root.jpg");
+    }
+
+    #[test]
+    fn scans_watch_folder_counts_current_level_images() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("fresh.jpg"), [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        fs::write(temp.path().join("image.avif"), b"not supported").unwrap();
+        fs::write(temp.path().join("notes.txt"), b"hello").unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        fs::write(
+            temp.path().join("nested").join("child.png"),
+            [137, 80, 78, 71, 13, 10, 26, 10],
+        )
+        .unwrap();
+
+        let scan = scan_watch_folder(temp.path().to_string_lossy().to_string()).unwrap();
+
+        assert_eq!(scan.all_files, 3);
+        assert_eq!(scan.supported_files, 1);
+        assert_eq!(scan.compressed_files, 0);
+        assert_eq!(scan.uncompressed_files, 1);
+        assert_eq!(scan.files[0].name, "fresh.jpg");
+    }
+
+    #[test]
+    fn treats_source_as_compressed_when_marked_output_exists_in_compressed_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photo.jpg");
+        fs::write(&source, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        write_output_file(
+            &source.to_string_lossy(),
+            &[0xff, 0xd8, 0xff, 0xd9],
+            "same",
+            &OutputPolicy::Subdirectory,
+            None,
+            &CompressOptions {
+                quality: 80,
+                format: "same".to_string(),
+                max_width: None,
+                max_height: None,
+                preserve_metadata: false,
+                preserve_comfy_workflow: true,
+            },
+        )
+        .unwrap();
+
+        let scan = scan_watch_folder(temp.path().to_string_lossy().to_string()).unwrap();
+
+        assert_eq!(scan.supported_files, 1);
+        assert_eq!(scan.compressed_files, 1);
+        assert_eq!(scan.uncompressed_files, 0);
+        assert!(scan.files[0].is_compressed);
     }
 }
