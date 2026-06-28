@@ -9,7 +9,10 @@ use serde_json::{json, Value};
 use tokio::fs;
 
 use crate::{
-    config::{api_key_for, update_tinify_usage_for_key, update_usage_for_key},
+    config::{
+        api_key_for, mark_api_key_quota_exhausted, update_tinify_usage_for_key,
+        update_usage_for_key,
+    },
     diagnostics::{log_api_error, log_api_event, log_api_response, summarize_headers},
     models::{now_iso, ApiImageResponse, CompressOptions, Provider, UsageResult},
 };
@@ -111,8 +114,24 @@ pub async fn fetch_compresto_usage(key_id: Option<&str>) -> Result<UsageResult, 
             .take(1200)
             .collect::<String>(),
     );
+    let (used, limit, remaining) = compresto_usage_numbers(&value);
+
+    let result = UsageResult {
+        provider: Provider::Compresto,
+        status: "ok".to_string(),
+        used,
+        limit,
+        remaining,
+        last_checked_at: now_iso(),
+        message: "Compresto usage refreshed".to_string(),
+    };
+    let _ = update_usage_for_key(Provider::Compresto, key_id, &result);
+    Ok(result)
+}
+
+fn compresto_usage_numbers(value: &Value) -> (Option<u32>, Option<u32>, Option<u32>) {
     let used = value_u32_deep(
-        &value,
+        value,
         &[
             "used",
             "usage",
@@ -127,7 +146,7 @@ pub async fn fetch_compresto_usage(key_id: Option<&str>) -> Result<UsageResult, 
         ],
     );
     let limit = value_u32_deep(
-        &value,
+        value,
         &[
             "limit",
             "quota",
@@ -136,30 +155,25 @@ pub async fn fetch_compresto_usage(key_id: Option<&str>) -> Result<UsageResult, 
             "maximum",
             "allowed",
             "apiCallLimit",
-            "credits",
             "totalCredits",
         ],
     );
     let remaining = value_u32_deep(
-        &value,
-        &["remaining", "remainingCredits", "creditsLeft", "left"],
+        value,
+        &[
+            "remaining",
+            "remainingCredits",
+            "credits",
+            "credit",
+            "creditsLeft",
+            "left",
+        ],
     )
     .or_else(|| match (used, limit) {
         (Some(used), Some(limit)) => Some(limit.saturating_sub(used)),
         _ => None,
     });
-
-    let result = UsageResult {
-        provider: Provider::Compresto,
-        status: "ok".to_string(),
-        used,
-        limit,
-        remaining,
-        last_checked_at: now_iso(),
-        message: "Compresto usage refreshed".to_string(),
-    };
-    let _ = update_usage_for_key(Provider::Compresto, key_id, &result);
-    Ok(result)
+    (used, limit, remaining)
 }
 
 pub async fn compress_with_tinify(
@@ -193,7 +207,7 @@ pub async fn compress_with_tinify(
         &shrink_headers,
     );
     if !shrink.status().is_success() {
-        return Err(read_status_error("Tinify", "shrink.error_body", shrink).await);
+        return Err(read_tinify_status_error("shrink.error_body", shrink, key_id).await);
     }
 
     let result_url = shrink_headers
@@ -203,7 +217,7 @@ pub async fn compress_with_tinify(
         .to_string();
 
     let (output_bytes, output_headers) =
-        fetch_tinify_result_bytes(&client, &result_url, &auth, options).await?;
+        fetch_tinify_result_bytes(&client, &result_url, &auth, options, key_id).await?;
     let compressed_size = output_bytes.len() as u64;
     let usage = tinify_usage_from_headers(&output_headers)
         .or_else(|| tinify_usage_from_headers(&shrink_headers));
@@ -263,7 +277,7 @@ pub async fn fetch_tinify_usage(key_id: Option<&str>) -> Result<UsageResult, Api
         });
     }
 
-    Err(read_status_error("Tinify", "usage.error_body", response).await)
+    Err(read_tinify_status_error("usage.error_body", response, key_id).await)
 }
 
 fn tinify_auth_header(api_key: &str) -> String {
@@ -315,9 +329,10 @@ async fn fetch_tinify_result_bytes(
     result_url: &str,
     auth: &str,
     options: &CompressOptions,
+    key_id: Option<&str>,
 ) -> Result<(Vec<u8>, HeaderMap), ApiError> {
     if !tinify_needs_options(options) {
-        return fetch_tinify_result_bytes_resumable(client, result_url, auth).await;
+        return fetch_tinify_result_bytes_resumable(client, result_url, auth, key_id).await;
     }
 
     for attempt in 1..=TINIFY_RESULT_RETRIES {
@@ -336,7 +351,7 @@ async fn fetch_tinify_result_bytes(
         let headers = response.headers().clone();
         log_api_response("Tinify", &response_stage, response.status(), &headers);
         if !response.status().is_success() {
-            return Err(read_status_error("Tinify", "result.error_body", response).await);
+            return Err(read_tinify_status_error("result.error_body", response, key_id).await);
         }
 
         match read_response_bytes("Tinify", &body_stage, response, Some(&headers)).await {
@@ -359,6 +374,7 @@ async fn fetch_tinify_result_bytes_resumable(
     client: &Client,
     result_url: &str,
     auth: &str,
+    key_id: Option<&str>,
 ) -> Result<(Vec<u8>, HeaderMap), ApiError> {
     let mut bytes = Vec::new();
     let mut expected_total = None;
@@ -397,11 +413,13 @@ async fn fetch_tinify_result_bytes_resumable(
             expected_total = None;
             response_offset = 0;
         } else if offset > 0 && response.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(read_status_error("Tinify", "result.range_error_body", response).await);
+            return Err(
+                read_tinify_status_error("result.range_error_body", response, key_id).await,
+            );
         }
 
         if !response.status().is_success() {
-            return Err(read_status_error("Tinify", "result.error_body", response).await);
+            return Err(read_tinify_status_error("result.error_body", response, key_id).await);
         }
 
         expected_total = content_range_total(&headers)
@@ -588,6 +606,37 @@ async fn read_status_error(service: &str, stage: &str, response: Response) -> Ap
         Err(error) => format!("[failed to read error body: {error}]"),
     };
     api_status_error(service, status, Some(body))
+}
+
+async fn read_tinify_status_error(
+    stage: &str,
+    response: Response,
+    key_id: Option<&str>,
+) -> ApiError {
+    let error = read_status_error("Tinify", stage, response).await;
+    if is_tinify_quota_exhausted_error(&error) {
+        let _ = mark_api_key_quota_exhausted(Provider::Tinify, key_id);
+    }
+    error
+}
+
+fn is_tinify_quota_exhausted_error(error: &ApiError) -> bool {
+    let ApiError::Remote {
+        service,
+        status,
+        body,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    if service != "Tinify" || *status != 429 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("toomanyrequests")
+        || body.contains("monthly limit has been exceeded")
+        || body.contains("quota has been reached")
 }
 
 fn map_reqwest_error(
@@ -800,5 +849,20 @@ mod tests {
         });
         assert_eq!(value_u32_deep(&value, &["requestsUsed"]), Some(17));
         assert_eq!(value_u32_deep(&value, &["monthlyLimit"]), Some(100));
+    }
+
+    #[test]
+    fn treats_compresto_credits_as_remaining_usage() {
+        let value = json!({
+            "credits": 88,
+            "creditsUsed": 12,
+            "totalCredits": 100
+        });
+
+        let (used, limit, remaining) = compresto_usage_numbers(&value);
+
+        assert_eq!(used, Some(12));
+        assert_eq!(limit, Some(100));
+        assert_eq!(remaining, Some(88));
     }
 }

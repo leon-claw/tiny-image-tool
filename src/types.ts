@@ -2,6 +2,10 @@ export type Provider = "Compresto" | "Tinify";
 
 export type OutputPolicy = "Subdirectory" | "Overwrite" | "CustomDirectory";
 
+export type QueueSource = "manual" | "watch";
+
+export type Language = "zh" | "en";
+
 export interface AppConfig {
   comprestoApiKey: string;
   tinifyApiKey: string;
@@ -15,6 +19,8 @@ export interface AppConfig {
   watchFolderPath?: string | null;
   watchFolders: WatchFolderConfig[];
   keepAwakeDuringCompression: boolean;
+  preserveComfyWorkflow: boolean;
+  language: Language;
 }
 
 export interface ApiKeyEntry {
@@ -25,6 +31,7 @@ export interface ApiKeyEntry {
   limit?: number | null;
   remaining?: number | null;
   lastCheckedAt?: string | null;
+  quotaExhausted?: boolean;
 }
 
 export interface ImageFile {
@@ -66,6 +73,7 @@ export interface QueueItem extends ImageFile {
   id: string;
   status: "queued" | "processing" | "done" | "failed" | "cancelled";
   selected: boolean;
+  sources?: QueueSource[];
   outputPath?: string;
   compressedSize?: number;
   savingsPercent?: number;

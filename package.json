@@ -12,6 +12,7 @@
     "tauri:build": "tauri build",
     "tauri:build:windows": "tauri build --bundles nsis,msi",
     "build:windows": "bash scripts/build-windows.sh",
+    "site:dev": "npm --prefix site run dev -- --port 3000",
     "test": "vitest run"
   },
   "dependencies": {

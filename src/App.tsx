@@ -18,6 +18,7 @@ import {
   Play,
   Plus,
   RefreshCcw,
+  Settings as SettingsIcon,
   Trash2,
   X,
   Square,
@@ -28,6 +29,7 @@ import type {
   CompressOptions,
   CompressResult,
   ImageFile,
+  Language,
   OutputPolicy,
   Provider,
   QueueItem,
@@ -37,46 +39,28 @@ import type {
   WatchFolderSummary,
 } from "./types";
 import appIcon from "./assets/app-icon.png";
+import { DEFAULT_LANGUAGE, DEFAULT_PROVIDER, defaultConfig, defaultOptions, optionsFromConfig } from "./defaults";
+import { createTranslator, normalizeLanguage, type Translator } from "./i18n";
 import {
   formatBytes,
   formatDateTime,
+  keyUsageMeta,
+  mergeQueueItems,
+  queueHasSource,
   prioritizeQueueByStatus,
-  toQueueItems,
   totalBytes,
+  type KeyUsageLabels,
   type StatusFilter,
 } from "./utils";
-
-const defaultConfig: AppConfig = {
-  comprestoApiKey: "",
-  tinifyApiKey: "",
-  tinifyCompressionCount: null,
-  tinifyLastCheckedAt: null,
-  comprestoKeys: [],
-  tinifyKeys: [],
-  activeComprestoKeyId: null,
-  activeTinifyKeyId: null,
-  watchFolderEnabled: false,
-  watchFolderPath: null,
-  watchFolders: [],
-  keepAwakeDuringCompression: true,
-};
-
-const defaultOptions: CompressOptions = {
-  quality: 80,
-  format: "same",
-  maxWidth: null,
-  maxHeight: null,
-  preserveMetadata: false,
-  preserveComfyWorkflow: true,
-};
 
 const MAX_PARALLEL_COMPRESSIONS = 5;
 const WATCH_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const WATCH_NEW_FILE_DEBOUNCE_MS = 1600;
+const defaultTranslator = createTranslator(DEFAULT_LANGUAGE);
 
 type ToastTone = "info" | "success" | "warning" | "error";
 type WatchScanReason = "focus" | "timer" | "new-file" | "manual" | "enabled";
-type AppView = "workbench" | "watch-folders";
+type AppView = "workbench" | "watch-folders" | "settings";
 
 type ToastMessage = {
   id: number;
@@ -85,7 +69,7 @@ type ToastMessage = {
 };
 
 function App() {
-  const [activeProvider, setActiveProvider] = useState<Provider>("Compresto");
+  const [activeProvider, setActiveProvider] = useState<Provider>(DEFAULT_PROVIDER);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [usage, setUsage] = useState<Record<Provider, UsageResult | null>>({
@@ -103,8 +87,10 @@ function App() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("default");
   const [view, setView] = useState<AppView>("workbench");
   const [activeWatchFolderId, setActiveWatchFolderId] = useState<string | null>(null);
-  const [notice, setNotice] = useState("选择文件或文件夹后开始压缩。已写入埋点的图片会自动跳过。");
+  const [notice, setNotice] = useState(defaultTranslator("notice.ready"));
   const [toast, setToast] = useState<ToastMessage | null>(null);
+  const language = normalizeLanguage(config.language);
+  const t = useMemo(() => createTranslator(language), [language]);
   const pauseRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
   const configSaveRef = useRef<Promise<AppConfig | null>>(Promise.resolve(null));
@@ -115,7 +101,10 @@ function App() {
   const optionsRef = useRef<CompressOptions>(defaultOptions);
   const outputPolicyRef = useRef<OutputPolicy>("Subdirectory");
   const customOutputDirRef = useRef("");
-  const activeProviderRef = useRef<Provider>("Compresto");
+  const activeProviderRef = useRef<Provider>(DEFAULT_PROVIDER);
+  const tRef = useRef<Translator>(defaultTranslator);
+  const viewRef = useRef<AppView>("workbench");
+  const activeWatchFolderIdRef = useRef<string | null>(null);
   const watchScanTimerRef = useRef<number | null>(null);
   const watchScanInFlightRef = useRef(false);
   const pendingWatchScanFoldersRef = useRef<Set<string> | null>(null);
@@ -129,7 +118,10 @@ function App() {
     [activeWatchFolderId, config],
   );
   const visibleQueue = useMemo(
-    () => (activeWatchFolder ? queue.filter((item) => isPathInFolder(item.path, activeWatchFolder.path)) : queue),
+    () =>
+      activeWatchFolder
+        ? queue.filter((item) => isPathInFolder(item.path, activeWatchFolder.path))
+        : queue.filter((item) => queueHasSource(item, "manual")),
     [activeWatchFolder, queue],
   );
   const stats = useMemo(() => {
@@ -220,6 +212,22 @@ function App() {
   }, [activeProvider]);
 
   useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+
+  useEffect(() => {
+    setOptions((current) => optionsFromConfig(config, current));
+  }, [config.preserveComfyWorkflow]);
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  useEffect(() => {
+    activeWatchFolderIdRef.current = activeWatchFolderId;
+  }, [activeWatchFolderId]);
+
+  useEffect(() => {
     const folders = enabledWatchFolders(config).map((folder) => folder.path);
     if (!folders.length) {
       void invoke("stop_folder_watch");
@@ -234,6 +242,10 @@ function App() {
       void invoke("stop_folder_watch");
     };
   }, [config.watchFolders, config.watchFolderEnabled, config.watchFolderPath]);
+
+  function msg(...args: Parameters<Translator>) {
+    return tRef.current(...args);
+  }
 
   function showToast(message: string, tone: ToastTone = "info") {
     if (toastTimerRef.current) {
@@ -259,7 +271,7 @@ function App() {
 
   async function saveConfig(
     nextConfig: AppConfig = config,
-    message = "API Key 已保存到本地配置。",
+    message = msg("toast.configSaved"),
     version?: number,
   ): Promise<AppConfig | null> {
     try {
@@ -278,9 +290,9 @@ function App() {
 
   async function addPaths(paths: string[]) {
     try {
-      const files = await invoke<QueueItem[]>("scan_paths", { paths });
-      updateQueue((current) => [...current, ...toQueueItems(files, current)]);
-      setNotice(`已加载 ${files.length} 个支持的图片文件。`);
+      const files = await invoke<ImageFile[]>("scan_paths", { paths });
+      updateQueue((current) => mergeQueueItems(files, current, "manual"));
+      setNotice(msg("toast.filesLoaded", { count: files.length }));
     } catch (error) {
       setNotice(String(error));
     }
@@ -322,12 +334,12 @@ function App() {
       .map((path) => createWatchFolder(path));
 
     if (!additions.length) {
-      showToast("这些文件夹已经在监听列表中。", "warning");
+      showToast(msg("toast.watchFolderDuplicate"), "warning");
       return;
     }
 
     const nextFolders = [...current, ...additions];
-    persistWatchFolders(nextFolders, `已添加 ${additions.length} 个监听文件夹。`);
+    persistWatchFolders(nextFolders, msg("toast.watchFolderAdded", { count: additions.length }));
     setView("watch-folders");
     setTimeout(() => scanWatchedFolders("manual", additions.map((folder) => folder.path)), 0);
   }
@@ -340,14 +352,14 @@ function App() {
     const folders = watchFoldersFromConfig(configRef.current).map((folder) =>
       folder.id === id ? { ...folder, enabled } : folder,
     );
-    persistWatchFolders(folders, enabled ? "监听文件夹已启用。" : "监听文件夹已暂停。");
+    persistWatchFolders(folders, enabled ? msg("toast.watchFolderEnabled") : msg("toast.watchFolderPaused"));
     stopWatchRunIfNoEnabledFolders(folders);
   }
 
   function removeWatchFolder(id: string) {
     const folder = watchFoldersFromConfig(configRef.current).find((candidate) => candidate.id === id);
     const folders = watchFoldersFromConfig(configRef.current).filter((candidate) => candidate.id !== id);
-    persistWatchFolders(folders, "监听文件夹已移除。");
+    persistWatchFolders(folders, msg("toast.watchFolderRemoved"));
     setWatchScans((current) => {
       if (!folder) return current;
       const next = { ...current };
@@ -371,14 +383,30 @@ function App() {
   function toggleKeepAwake(enabled: boolean) {
     persistKeyChange(
       { ...configRef.current, keepAwakeDuringCompression: enabled },
-      enabled ? "压缩时保持设备唤醒已开启。" : "压缩时保持设备唤醒已关闭。",
+      msg("settings.keepAwakeSaved", { state: enabled ? msg("settings.enabled") : msg("settings.disabled") }),
+    );
+  }
+
+  function togglePreserveComfyWorkflow(enabled: boolean) {
+    setOptions((current) => ({ ...current, preserveComfyWorkflow: enabled }));
+    persistKeyChange(
+      { ...configRef.current, preserveComfyWorkflow: enabled },
+      msg("settings.comfySaved", { state: enabled ? msg("settings.enabled") : msg("settings.disabled") }),
+    );
+  }
+
+  function selectLanguage(language: Language) {
+    const nextT = createTranslator(language);
+    persistKeyChange(
+      { ...configRef.current, language },
+      nextT("settings.languageSaved", { language: language === "en" ? "English" : "中文" }),
     );
   }
 
   async function refreshUsage(target: Provider = activeProvider) {
     const targetKeyId = activeKeyId(config, target);
-    if (!hasUsableApiKey(config, target)) {
-      showToast(`请先添加并选择 ${target} API Key，再刷新使用量。`, "warning");
+    if (!hasConfiguredApiKey(config, target)) {
+      showToast(msg("toast.refreshUsageMissingKey", { provider: target }), "warning");
       return;
     }
 
@@ -390,8 +418,11 @@ function App() {
         activeKeyId(configRef.current, target) === targetKeyId ? { ...current, [target]: result } : current,
       );
       setConfig((current) => applyUsageToConfig(current, target, result, targetKeyId));
-      showToast(`${target} 使用量已刷新。`, "success");
+      showToast(msg("toast.usageRefreshed", { provider: target }), "success");
     } catch (error) {
+      if (target === "Tinify" && isQuotaExceededMessage(error)) {
+        void loadConfig();
+      }
       setUsage((current) => ({
         ...current,
         [target]: {
@@ -432,7 +463,7 @@ function App() {
 
   async function scanWatchedFolders(reason: WatchScanReason, folderPaths?: string[]) {
     const currentConfig = configRef.current;
-    const allFolders = enabledWatchFolders(currentConfig);
+    const allFolders = reason === "manual" ? watchFoldersFromConfig(currentConfig) : enabledWatchFolders(currentConfig);
     const selectedPaths = folderPaths?.length
       ? new Set(folderPaths.map(normalizePathForCompare))
       : null;
@@ -459,11 +490,8 @@ function App() {
           const checkedAt = new Date().toISOString();
           totalFiles += scan.files.length;
           scan.files.forEach((file) => runnablePaths.add(file.path));
-          const newItems = toQueueItems(scan.files, queueRef.current);
-          totalNewItems += newItems.length;
-          if (newItems.length) {
-            updateQueue((current) => [...current, ...toQueueItems(scan.files, current)]);
-          }
+          totalNewItems += scan.files.filter((file) => !queueRef.current.some((item) => item.path === file.path)).length;
+          updateQueue((current) => mergeQueueItems(scan.files, current, "watch"));
           setWatchScans((current) => ({
             ...current,
             [folder.path]: { ...scan, lastScannedAt: checkedAt, lastError: null },
@@ -482,23 +510,25 @@ function App() {
               lastError: String(error),
             },
           }));
-          showToast(`${folderName(folder.path)} 扫描失败：${String(error)}`, "error");
+          showToast(msg("toast.scanFailed", { folder: folderName(folder.path), error: String(error) }), "error");
         }
       }
       if (reason === "manual") {
-        showToast(totalNewItems ? `发现 ${totalNewItems} 个新图片。` : "监听文件夹没有新图片。", "info");
+        showToast(totalNewItems ? msg("toast.newImagesFound", { count: totalNewItems }) : msg("toast.noNewImages"), "info");
       }
-      setNotice(`监听文件夹已扫描：${folders.length} 个目录，${totalFiles} 个当前层级图片。`);
+      if (viewRef.current === "watch-folders" || activeWatchFolderIdRef.current) {
+        setNotice(msg("notice.watchScanned", { folders: folders.length, files: totalFiles }));
+      }
 
       const runnable = runnableItems(queueRef.current).filter((item) => runnablePaths.has(item.path));
       if (!runnable.length) return;
       if (outputPolicyRef.current === "Overwrite") {
-        showToast("监听自动压缩不会执行覆盖源文件。请改为 compressed/ 或自定义输出目录。", "warning");
+        showToast(msg("toast.watchNoOverwrite"), "warning");
         return;
       }
       const provider = activeProviderRef.current;
       if (!hasUsableApiKey(configRef.current, provider)) {
-        showToast(`监听发现新图片，但 ${provider} API Key 不可用。`, "warning");
+        showToast(msg("toast.watchMissingKey", { reason: apiKeyUnavailableMessage(configRef.current, provider, msg) }), "warning");
         return;
       }
       await runCompression(runnable, "watch");
@@ -511,20 +541,23 @@ function App() {
   }
 
   async function startCompression() {
-    const runnable = runnableItems(activeWatchFolder ? queueRef.current.filter((item) => isPathInFolder(item.path, activeWatchFolder.path)) : queueRef.current);
+    const workspaceItems = activeWatchFolder
+      ? queueRef.current.filter((item) => isPathInFolder(item.path, activeWatchFolder.path))
+      : queueRef.current.filter((item) => queueHasSource(item, "manual"));
+    const runnable = runnableItems(workspaceItems);
     if (!runnable.length) {
-      showToast(queueRef.current.length ? "当前没有可压缩的图片。已压缩文件会被自动跳过。" : "请先选择文件或文件夹。", "warning");
+      showToast(workspaceItems.length ? msg("toast.noRunnable") : msg("toast.chooseFilesFirst"), "warning");
       return;
     }
     if (!hasUsableApiKey(config, activeProvider)) {
-      showToast(`请先添加并选择 ${activeProvider} API Key，再开始压缩。`, "warning");
+      showToast(apiKeyUnavailableMessage(config, activeProvider, msg), "warning");
       return;
     }
     if (outputPolicy === "CustomDirectory" && !customOutputDir) {
-      showToast("请先选择输出目录。", "warning");
+      showToast(msg("toast.chooseOutputDir"), "warning");
       return;
     }
-    if (outputPolicy === "Overwrite" && !window.confirm("覆盖模式会直接替换源文件，是否继续？")) {
+    if (outputPolicy === "Overwrite" && !window.confirm(msg("confirm.overwrite"))) {
       return;
     }
 
@@ -551,7 +584,11 @@ function App() {
     await configSaveRef.current;
     const keepAwakeStarted = await beginKeepAwakeIfNeeded();
     setNotice(
-      `${source === "watch" ? "监听任务" : "手动任务"}正在处理 ${runnable.length} 个文件，最多 ${MAX_PARALLEL_COMPRESSIONS} 个并行。每张图片会使用派发时选中的 API Key。`,
+      msg("notice.running", {
+        source: source === "watch" ? msg("source.watch") : msg("source.manual"),
+        count: runnable.length,
+        parallel: MAX_PARALLEL_COMPRESSIONS,
+      }),
     );
 
     try {
@@ -569,7 +606,7 @@ function App() {
           updateQueue((current) =>
             current.map((candidate) =>
               candidate.id === item.id
-                ? { ...candidate, status: "failed", error: `${itemProvider} API Key 不可用，请重新选择。` }
+                ? { ...candidate, status: "failed", error: apiKeyUnavailableMessage(currentConfig, itemProvider, msg) }
                 : candidate,
             ),
           );
@@ -596,7 +633,7 @@ function App() {
           if (stopRequestedRef.current) {
             updateQueue((current) =>
               current.map((candidate) =>
-                candidate.id === item.id ? { ...candidate, status: "cancelled", error: "已停止" } : candidate,
+                candidate.id === item.id ? { ...candidate, status: "cancelled", error: msg("error.stopped") } : candidate,
               ),
             );
             return;
@@ -629,11 +666,14 @@ function App() {
             return;
           }
         } catch (error) {
+          if (itemProvider === "Tinify" && isQuotaExceededMessage(error)) {
+            void loadConfig();
+          }
           updateQueue((current) =>
             current.map((candidate) =>
               candidate.id === item.id
                 ? stopRequestedRef.current
-                  ? { ...candidate, status: "cancelled", error: "已停止" }
+                  ? { ...candidate, status: "cancelled", error: msg("error.stopped") }
                   : { ...candidate, status: "failed", error: String(error) }
                 : candidate,
             ),
@@ -667,10 +707,10 @@ function App() {
     setIsPauseRequested(false);
     setNotice(
       stopRequestedRef.current
-        ? "已停止。正在压缩的结果已丢弃。"
+        ? msg("status.stopped")
         : pauseRef.current
-          ? "已暂停。再次开始会继续处理未完成文件。"
-          : "处理完成。",
+          ? msg("status.paused")
+          : msg("status.done"),
     );
     if (!pauseRef.current && autoRunAfterCurrentBatchRef.current) {
       autoRunAfterCurrentBatchRef.current = false;
@@ -689,7 +729,7 @@ function App() {
       await invoke("begin_power_assertion");
       return true;
     } catch (error) {
-      showToast(`保持设备唤醒未能开启：${String(error)}`, "warning");
+      showToast(msg("toast.keepAwakeStartFailed", { error: String(error) }), "warning");
       return false;
     }
   }
@@ -699,14 +739,14 @@ function App() {
     try {
       await invoke("end_power_assertion");
     } catch (error) {
-      showToast(`保持设备唤醒未能释放：${String(error)}`, "warning");
+      showToast(msg("toast.keepAwakeEndFailed", { error: String(error) }), "warning");
     }
   }
 
   function requestPause() {
     pauseRef.current = true;
     setIsPauseRequested(true);
-    setNotice("暂停请求已收到，当前文件完成后会停止。");
+    setNotice(msg("notice.pauseRequested"));
   }
 
   function requestImmediateStop() {
@@ -715,10 +755,10 @@ function App() {
     pauseRef.current = true;
     autoRunAfterCurrentBatchRef.current = false;
     setIsPauseRequested(true);
-    setNotice("正在立即停止，当前压缩结果会被丢弃。");
+    setNotice(msg("notice.stopRequested"));
     updateQueue((current) =>
       current.map((item) =>
-        item.status === "processing" ? { ...item, status: "cancelled", error: "已停止" } : item,
+        item.status === "processing" ? { ...item, status: "cancelled", error: msg("error.stopped") } : item,
       ),
     );
     const runId = activeCompressionRunIdRef.current;
@@ -740,7 +780,7 @@ function App() {
       pauseRef.current = true;
       autoRunAfterCurrentBatchRef.current = false;
       setIsPauseRequested(true);
-      setNotice("监听已暂停，当前正在上传的图片完成后会停止。");
+      setNotice(msg("notice.watchPaused"));
     }
   }
 
@@ -797,16 +837,16 @@ function App() {
   }
 
   function renderSettingsPane(showRunBar: boolean) {
+    const keyUsageLabels = {
+      exhausted: t("apiKey.exhausted"),
+      noUsage: t("apiKey.noUsage"),
+      remaining: (count: number) => t("apiKey.remaining", { count }),
+      used: (count: number) => t("apiKey.used", { count }),
+    };
+
     return (
       <aside className="settings-pane">
         <div className="tabs">
-          <button
-            type="button"
-            className={activeProvider === "Compresto" ? "active" : ""}
-            onClick={() => selectProvider("Compresto")}
-          >
-            Compresto
-          </button>
           <button
             type="button"
             className={activeProvider === "Tinify" ? "active" : ""}
@@ -814,10 +854,18 @@ function App() {
           >
             Tinify
           </button>
+          <button
+            type="button"
+            className={activeProvider === "Compresto" ? "active" : ""}
+            onClick={() => selectProvider("Compresto")}
+          >
+            Compresto
+          </button>
         </div>
 
         {activeProvider === "Compresto" ? (
           <ComprestoSettings
+            t={t}
             config={config}
             persistKeyChange={persistKeyChange}
             notify={showToast}
@@ -825,13 +873,14 @@ function App() {
             setOutputPolicy={setOutputPolicy}
             chooseOutputDir={chooseOutputDir}
             customOutputDir={customOutputDir}
-            toggleKeepAwake={toggleKeepAwake}
             usage={usage.Compresto}
             refreshUsage={() => refreshUsage("Compresto")}
             loading={isRefreshingUsage}
+            keyUsageLabels={keyUsageLabels}
           />
         ) : (
           <TinifySettings
+            t={t}
             config={config}
             persistKeyChange={persistKeyChange}
             notify={showToast}
@@ -841,10 +890,10 @@ function App() {
             setOutputPolicy={setOutputPolicy}
             chooseOutputDir={chooseOutputDir}
             customOutputDir={customOutputDir}
-            toggleKeepAwake={toggleKeepAwake}
             usage={usage.Tinify}
             refreshUsage={() => refreshUsage("Tinify")}
             loading={isRefreshingUsage}
+            keyUsageLabels={keyUsageLabels}
           />
         )}
 
@@ -852,15 +901,15 @@ function App() {
           <footer className="run-bar">
             <button type="button" className="primary" onClick={startCompression} disabled={isRunning}>
               {isRunning ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-              开始
+              {t("run.start")}
             </button>
             <button type="button" onClick={requestPause} disabled={!isRunning || isPauseRequested}>
               <Pause size={18} />
-              {isPauseRequested ? "暂停中" : "暂停"}
+              {isPauseRequested ? t("run.pausing") : t("run.pause")}
             </button>
             <button type="button" className="danger" onClick={requestImmediateStop} disabled={!isRunning}>
               <Square size={17} />
-              立即停止
+              {t("run.stopNow")}
             </button>
           </footer>
         ) : null}
@@ -868,10 +917,65 @@ function App() {
     );
   }
 
-  if (view === "watch-folders") {
-    return (
-      <>
+  return (
+    <>
+      <main className={view === "settings" ? "app-shell settings-only" : "app-shell"} data-provider={activeProvider.toLowerCase()}>
+      <aside className="mode-rail">
+        <div className="mode-brand">
+          <div className="brand-sigil">
+            <img src={appIcon} alt="" />
+          </div>
+          <div>
+            <strong>Tiny Image Tool</strong>
+            <span>{t("app.subtitle")}</span>
+          </div>
+        </div>
+        <nav className="mode-nav" aria-label={t("nav.settings")}>
+          <button
+            type="button"
+            className={view === "watch-folders" ? "active" : ""}
+            onClick={() => setView("watch-folders")}
+          >
+            <ListTree size={17} />
+            {t("nav.watchFolders")}
+          </button>
+          <button
+            type="button"
+            className={view === "workbench" ? "active" : ""}
+            onClick={() => {
+              setActiveWatchFolderId(null);
+              setView("workbench");
+            }}
+          >
+            <FileImage size={17} />
+            {t("nav.workbench")}
+          </button>
+          <button
+            type="button"
+            className={view === "settings" ? "active" : ""}
+            onClick={() => {
+              setActiveWatchFolderId(null);
+              setView("settings");
+            }}
+          >
+            <SettingsIcon size={17} />
+            {t("nav.settings")}
+          </button>
+        </nav>
+      </aside>
+
+      {view === "settings" ? (
+        <SettingsPage
+          t={t}
+          language={language}
+          config={config}
+          selectLanguage={selectLanguage}
+          toggleKeepAwake={toggleKeepAwake}
+          togglePreserveComfyWorkflow={togglePreserveComfyWorkflow}
+        />
+      ) : view === "watch-folders" ? (
         <WatchFoldersPage
+          t={t}
           summaries={watchFolderSummaries}
           isScanning={isWatchScanning}
           addFolders={chooseWatchFolders}
@@ -881,35 +985,20 @@ function App() {
           removeFolder={removeWatchFolder}
           setAllEnabled={(enabled) => {
             const folders = watchFoldersFromConfig(configRef.current).map((folder) => ({ ...folder, enabled }));
-            persistWatchFolders(folders, enabled ? "全部监听文件夹已启用。" : "全部监听文件夹已暂停。");
+            persistWatchFolders(folders, enabled ? msg("toast.allWatchFoldersEnabled") : msg("toast.allWatchFoldersPaused"));
             stopWatchRunIfNoEnabledFolders(folders);
           }}
-          backToWorkbench={() => {
-            setActiveWatchFolderId(null);
-            setView("workbench");
-          }}
-          settingsPane={renderSettingsPane(false)}
         />
-        <Toast toast={toast} onClose={() => setToast(null)} />
-      </>
-    );
-  }
-
-  return (
-    <>
-      <main className="app-shell" data-provider={activeProvider.toLowerCase()}>
-      <section className="file-pane">
+      ) : (
+        <section className="file-pane">
         <header className="file-toolbar">
           <div className="brand-lockup">
-            <div className="brand-sigil">
-              <img src={appIcon} alt="" />
-            </div>
             <div>
-              <h1>Tiny Image Tool</h1>
+              <h1>{activeWatchFolder ? folderName(activeWatchFolder.path) : t("nav.workbench")}</h1>
               {activeWatchFolder ? (
-                <div className="breadcrumb" aria-label="当前位置">
+                <div className="breadcrumb" aria-label={t("nav.watchFolders")}>
                   <button type="button" onClick={() => setView("watch-folders")}>
-                    监听文件夹
+                    {t("nav.watchFolders")}
                   </button>
                   <ChevronRight size={14} />
                   <span>{folderName(activeWatchFolder.path)}</span>
@@ -920,30 +1009,26 @@ function App() {
             </div>
           </div>
           <div className="toolbar-actions">
-            <button type="button" onClick={() => setView("watch-folders")}>
-              <ListTree size={17} />
-              监听文件夹
-            </button>
             <button type="button" onClick={chooseFiles}>
               <FileImage size={17} />
-              选择文件
+              {t("toolbar.chooseFiles")}
             </button>
             <button type="button" onClick={chooseFolder}>
               <FolderOpen size={17} />
-              选择文件夹
+              {t("toolbar.chooseFolder")}
             </button>
             <button type="button" className="ghost" onClick={removeSelected} disabled={!stats.selected || isRunning}>
               <Trash2 size={17} />
-              批量删除
+              {t("toolbar.deleteSelected")}
             </button>
           </div>
         </header>
 
         <section className="summary-strip">
-          <Metric label="文件" value={String(visibleQueue.length)} detail={`${stats.selected} 已选`} />
-          <Metric label="已压缩" value={String(stats.already)} detail="埋点命中" />
-          <Metric label="完成" value={String(stats.done)} detail={`${stats.failed} failed`} />
-          <Metric label="原始大小" value={formatBytes(stats.original)} detail={formatBytes(stats.compressed)} />
+          <Metric label={t("metric.files")} value={String(visibleQueue.length)} detail={t("metric.selected", { count: stats.selected })} />
+          <Metric label={t("metric.alreadyCompressed")} value={String(stats.already)} detail={t("metric.markerHit")} />
+          <Metric label={t("metric.done")} value={String(stats.done)} detail={`${stats.failed} ${t("filter.failed")}`} />
+          <Metric label={t("metric.originalSize")} value={formatBytes(stats.original)} detail={formatBytes(stats.compressed)} />
         </section>
 
         <section className="explorer">
@@ -954,28 +1039,34 @@ function App() {
                 checked={visibleQueue.length > 0 && stats.selected === visibleQueue.length}
                 onChange={toggleAllSelected}
               />
-              资产
+              {t("explorer.assets")}
             </label>
             <label className="status-filter">
-              状态
+              {t("explorer.status")}
               <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}>
-                <option value="default">默认</option>
-                <option value="queued">待处理</option>
-                <option value="processing">处理中</option>
-                <option value="failed">失败</option>
-                <option value="done">已压缩</option>
-                <option value="cancelled">已取消</option>
+                <option value="default">{t("filter.default")}</option>
+                <option value="queued">{t("filter.queued")}</option>
+                <option value="processing">{t("filter.processing")}</option>
+                <option value="failed">{t("filter.failed")}</option>
+                <option value="done">{t("filter.done")}</option>
+                <option value="cancelled">{t("filter.cancelled")}</option>
               </select>
             </label>
-            <span>大小</span>
-            <span>操作</span>
+            <span>{t("explorer.size")}</span>
+            <span>{t("explorer.actions")}</span>
           </div>
           <div className="explorer-body">
-            {queue.length === 0 ? (
-              <div className="empty-state">
+            {displayQueue.length === 0 ? (
+              <button
+                type="button"
+                className="empty-state"
+                onClick={activeWatchFolder ? undefined : chooseFiles}
+                disabled={Boolean(activeWatchFolder)}
+              >
                 <FileImage size={30} />
-                <span>未加载图片</span>
-              </div>
+                <span>{activeWatchFolder ? t("empty.folder") : t("empty.workbench")}</span>
+                <small>{activeWatchFolder ? t("empty.folderHint") : t("empty.workbenchHint")}</small>
+              </button>
             ) : (
               displayQueue.map((item) => (
                 <div className="file-row" key={item.id}>
@@ -987,12 +1078,12 @@ function App() {
                       <small>{item.path}</small>
                     </span>
                   </label>
-                  <StatusBadge item={item} />
+                  <StatusBadge item={item} t={t} />
                   <span className="size-cell">
                     {formatBytes(item.size)}
                     {item.compressedSize ? <small>{formatBytes(item.compressedSize)}</small> : null}
                   </span>
-                  <button className="icon" type="button" title="删除" onClick={() => removeOne(item.id)} disabled={isRunning}>
+                  <button className="icon" type="button" title={t("action.delete")} onClick={() => removeOne(item.id)} disabled={isRunning}>
                     <Trash2 size={16} />
                   </button>
                   {item.error ? <p className="row-error">{item.error}</p> : null}
@@ -1002,15 +1093,153 @@ function App() {
           </div>
         </section>
       </section>
+      )}
 
-      {renderSettingsPane(true)}
+      {view === "settings" ? null : renderSettingsPane(view === "workbench")}
       </main>
-      <Toast toast={toast} onClose={() => setToast(null)} />
+      <Toast toast={toast} onClose={() => setToast(null)} t={t} />
     </>
   );
 }
 
+function SettingsPage({
+  t,
+  language,
+  config,
+  selectLanguage,
+  toggleKeepAwake,
+  togglePreserveComfyWorkflow,
+}: {
+  t: Translator;
+  language: Language;
+  config: AppConfig;
+  selectLanguage: (language: Language) => void;
+  toggleKeepAwake: (enabled: boolean) => void;
+  togglePreserveComfyWorkflow: (enabled: boolean) => void;
+}) {
+  const keepAwakeState = config.keepAwakeDuringCompression ? t("settings.enabled") : t("settings.disabled");
+  const comfyState = config.preserveComfyWorkflow ? t("settings.enabled") : t("settings.disabled");
+  const languageLabel = language === "en" ? t("settings.languageEn") : t("settings.languageZh");
+
+  return (
+    <section className="settings-page">
+      <header className="settings-page-header">
+        <div className="settings-title-block">
+          <div className="settings-hero-icon">
+            <SettingsIcon size={21} />
+          </div>
+          <div>
+            <span>{t("settings.general")}</span>
+            <h1>{t("settings.title")}</h1>
+            <p>{t("settings.description")}</p>
+          </div>
+        </div>
+        <div className="settings-header-readout" aria-label={t("settings.general")}>
+          <span>{languageLabel}</span>
+          <span>{keepAwakeState}</span>
+          <span>{comfyState}</span>
+        </div>
+      </header>
+
+      <div className="settings-page-content">
+        <aside className="settings-overview">
+          <div>
+            <span className="settings-overview-label">{t("settings.general")}</span>
+            <h2>{t("settings.title")}</h2>
+            <p>{t("settings.description")}</p>
+          </div>
+          <dl>
+            <div>
+              <dt>{t("settings.language")}</dt>
+              <dd>{languageLabel}</dd>
+            </div>
+            <div>
+              <dt>{t("settings.keepAwake")}</dt>
+              <dd>{keepAwakeState}</dd>
+            </div>
+            <div>
+              <dt>{t("settings.preserveComfy")}</dt>
+              <dd>{comfyState}</dd>
+            </div>
+          </dl>
+        </aside>
+
+        <div className="settings-board">
+          <section className="settings-card settings-card-primary">
+            <div className="settings-card-heading">
+              <div className="settings-card-icon">
+                <SettingsIcon size={18} />
+              </div>
+              <div>
+                <span>{t("settings.general")}</span>
+                <h2>{t("settings.language")}</h2>
+              </div>
+            </div>
+            <label className="settings-control-row">
+              <span>
+                <strong>{t("settings.language")}</strong>
+                <small>{languageLabel}</small>
+              </span>
+              <select value={language} onChange={(event) => selectLanguage(event.target.value as Language)}>
+                <option value="zh">{t("settings.languageZh")}</option>
+                <option value="en">{t("settings.languageEn")}</option>
+              </select>
+            </label>
+          </section>
+
+          <section className="settings-card">
+            <div className="settings-card-heading">
+              <div className="settings-card-icon dark">
+                <Gauge size={18} />
+              </div>
+              <div>
+                <span>{keepAwakeState}</span>
+                <h2>{t("settings.keepAwake")}</h2>
+              </div>
+            </div>
+            <label className="settings-switch-row">
+              <span>
+                <strong>{t("settings.keepAwake")}</strong>
+                <small>{keepAwakeState}</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={config.keepAwakeDuringCompression}
+                onChange={(event) => toggleKeepAwake(event.target.checked)}
+              />
+            </label>
+          </section>
+
+          <section className="settings-card settings-card-wide">
+            <div className="settings-card-heading">
+              <div className="settings-card-icon blue">
+                <Layers3 size={18} />
+              </div>
+              <div>
+                <span>{comfyState}</span>
+                <h2>{t("settings.preserveComfy")}</h2>
+              </div>
+            </div>
+            <label className="settings-switch-row">
+              <span>
+                <strong>{t("settings.preserveComfy")}</strong>
+                <small>{t("settings.comfyHint")}</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={config.preserveComfyWorkflow}
+                onChange={(event) => togglePreserveComfyWorkflow(event.target.checked)}
+              />
+            </label>
+          </section>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function WatchFoldersPage({
+  t,
   summaries,
   isScanning,
   addFolders,
@@ -1019,9 +1248,8 @@ function WatchFoldersPage({
   toggleFolder,
   removeFolder,
   setAllEnabled,
-  backToWorkbench,
-  settingsPane,
 }: {
+  t: Translator;
   summaries: WatchFolderSummary[];
   isScanning: boolean;
   addFolders: () => void;
@@ -1030,8 +1258,6 @@ function WatchFoldersPage({
   toggleFolder: (id: string, enabled: boolean) => void;
   removeFolder: (id: string) => void;
   setAllEnabled: (enabled: boolean) => void;
-  backToWorkbench: () => void;
-  settingsPane: React.ReactNode;
 }) {
   const totalPending = summaries.reduce((sum, folder) => sum + folder.uncompressedFiles, 0);
   const totalProcessing = summaries.reduce((sum, folder) => sum + folder.processingFiles, 0);
@@ -1042,74 +1268,67 @@ function WatchFoldersPage({
   const enabledCount = summaries.filter((folder) => folder.enabled).length;
 
   return (
-    <main className="watch-shell">
       <section className="watch-page">
         <header className="watch-page-header">
           <div className="brand-lockup">
-            <div className="brand-sigil">
-              <img src={appIcon} alt="" />
-            </div>
             <div>
-              <h1>监听文件夹</h1>
-              <p>自动扫描当前层级图片，使用右侧当前服务商和 API Key。</p>
+              <h1>{t("watch.title")}</h1>
+              <p>{t("watch.description")}</p>
             </div>
           </div>
           <div className="toolbar-actions">
-            <button type="button" onClick={backToWorkbench}>
-              返回工作台
-            </button>
             <button type="button" onClick={addFolders}>
               <FolderOpen size={17} />
-              添加文件夹
+              {t("watch.addFolder")}
             </button>
-            <button type="button" className="refresh-button" onClick={scanAll} disabled={!enabledCount || isScanning}>
+            <button type="button" className="refresh-button" onClick={scanAll} disabled={!summaries.length || isScanning}>
               {isScanning ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />}
-              扫描全部
+              {t("watch.scanAll")}
             </button>
             <button type="button" className="ghost" onClick={() => setAllEnabled(enabledCount !== summaries.length)}>
-              {enabledCount === summaries.length && summaries.length ? "暂停全部" : "恢复全部"}
+              {enabledCount === summaries.length && summaries.length ? t("watch.pauseAll") : t("watch.resumeAll")}
             </button>
           </div>
         </header>
 
         <section className="watch-summary-grid">
-          <Metric label="监听中" value={String(enabledCount)} detail={`${summaries.length} folders`} />
-          <Metric label="待压缩" value={String(totalPending)} detail="未压缩图片" />
-          <Metric label="正在压缩" value={String(totalProcessing)} detail="全局并行队列" />
-          <Metric label="失败" value={String(totalFailed)} detail="最近任务" />
+          <Metric label={t("watch.enabledCount")} value={String(enabledCount)} detail={`${summaries.length} ${t("watch.folders")}`} />
+          <Metric label={t("watch.pending")} value={String(totalPending)} detail={t("watch.uncompressedImages")} />
+          <Metric label={t("watch.processing")} value={String(totalProcessing)} detail={t("watch.globalQueue")} />
+          <Metric label={t("watch.failed")} value={String(totalFailed)} detail={t("watch.recentTasks")} />
         </section>
 
         <details className="watch-extra-stats">
           <summary>
-            更多统计：所有文件 {totalFiles} · 支持格式 {totalSupported} · 已压缩 {totalCompressed} · 文件夹 {summaries.length}
+            {t("watch.moreStats", { all: totalFiles, supported: totalSupported, compressed: totalCompressed, folders: summaries.length })}
           </summary>
           <div className="watch-summary-grid compact">
-            <Metric label="文件夹" value={String(summaries.length)} detail={`${enabledCount} enabled`} />
-            <Metric label="所有文件" value={String(totalFiles)} detail="当前层级" />
-            <Metric label="支持格式" value={String(totalSupported)} detail="jpg/png/webp" />
-            <Metric label="已压缩" value={String(totalCompressed)} detail="埋点或输出命中" />
+            <Metric label={t("watch.folders")} value={String(summaries.length)} detail={`${enabledCount} ${t("settings.enabled")}`} />
+            <Metric label={t("watch.allFiles")} value={String(totalFiles)} detail={t("watch.currentLevel")} />
+            <Metric label={t("watch.supported")} value={String(totalSupported)} detail="jpg/png/webp" />
+            <Metric label={t("watch.compressed")} value={String(totalCompressed)} detail={t("watch.outputHit")} />
           </div>
         </details>
 
         <section className="watch-table">
           <div className="watch-table-scroll">
             <div className="watch-table-head">
-              <span>文件夹</span>
-              <span>状态</span>
-              <span>所有</span>
-              <span>未压缩</span>
-              <span>已压缩</span>
-              <span>处理中</span>
-              <span>失败</span>
-              <span className="watch-sticky-col">操作</span>
+              <span>{t("watch.folder")}</span>
+              <span>{t("watch.state")}</span>
+              <span>{t("watch.all")}</span>
+              <span>{t("watch.uncompressed")}</span>
+              <span>{t("watch.compressed")}</span>
+              <span>{t("watch.processing")}</span>
+              <span>{t("watch.failed")}</span>
+              <span className="watch-sticky-col">{t("explorer.actions")}</span>
             </div>
             {summaries.length === 0 ? (
               <div className="empty-state">
                 <FolderOpen size={30} />
-                <span>还没有监听文件夹</span>
+                <span>{t("watch.empty")}</span>
                 <button type="button" onClick={addFolders}>
                   <Plus size={16} />
-                  添加文件夹
+                  {t("watch.addFolder")}
                 </button>
               </div>
             ) : (
@@ -1121,13 +1340,13 @@ function WatchFoldersPage({
                       <strong>{folderName(folder.path)}</strong>
                       <small>{folder.path}</small>
                       <small>
-                        最近扫描：{folder.lastScannedAt ? formatDateTime(folder.lastScannedAt) : "Never"}
+                        {t("watch.lastScan", { time: folder.lastScannedAt ? formatDateTime(folder.lastScannedAt) : t("usage.never") })}
                         {folder.lastError ? ` · ${folder.lastError}` : ""}
                       </small>
                     </span>
                   </button>
                   <span className={folder.enabled ? "watch-state active" : "watch-state"}>
-                    {folder.enabled ? "监听中" : "已暂停"}
+                    {folder.enabled ? t("watch.running") : t("watch.paused")}
                   </span>
                   <b>{folder.allFiles}</b>
                   <b>{folder.uncompressedFiles}</b>
@@ -1135,13 +1354,13 @@ function WatchFoldersPage({
                   <b>{folder.processingFiles}</b>
                   <b>{folder.failedFiles}</b>
                   <div className="watch-row-actions watch-sticky-col">
-                    <button className="icon" type="button" title="进入" onClick={() => openFolder(folder.id)}>
+                    <button className="icon" type="button" title={t("action.enter")} onClick={() => openFolder(folder.id)}>
                       <ChevronRight size={16} />
                     </button>
-                    <button className="icon" type="button" title={folder.enabled ? "暂停" : "恢复"} onClick={() => toggleFolder(folder.id, !folder.enabled)}>
+                    <button className="icon" type="button" title={folder.enabled ? t("action.pause") : t("action.resume")} onClick={() => toggleFolder(folder.id, !folder.enabled)}>
                       {folder.enabled ? <Pause size={16} /> : <Play size={16} />}
                     </button>
-                    <button className="icon" type="button" title="移除" onClick={() => removeFolder(folder.id)}>
+                    <button className="icon" type="button" title={t("action.remove")} onClick={() => removeFolder(folder.id)}>
                       <Trash2 size={16} />
                     </button>
                   </div>
@@ -1151,12 +1370,11 @@ function WatchFoldersPage({
           </div>
         </section>
       </section>
-      {settingsPane}
-    </main>
   );
 }
 
 function ComprestoSettings({
+  t,
   config,
   persistKeyChange,
   notify,
@@ -1164,23 +1382,24 @@ function ComprestoSettings({
   setOutputPolicy,
   chooseOutputDir,
   customOutputDir,
-  toggleKeepAwake,
   usage,
   refreshUsage,
   loading,
+  keyUsageLabels,
 }: SettingsProps) {
   return (
     <div className="settings-content">
-      <Panel title="API Key" icon={<KeyRound size={18} />}>
-        <ApiKeyManager provider="Compresto" config={config} persistKeyChange={persistKeyChange} notify={notify} />
+      <Panel title={t("panel.apiKey")} icon={<KeyRound size={18} />}>
+        <ApiKeyManager provider="Compresto" config={config} persistKeyChange={persistKeyChange} notify={notify} t={t} keyUsageLabels={keyUsageLabels} />
       </Panel>
-      <OutputPanel {...{ config, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir, toggleKeepAwake }} />
-      <UsagePanel provider="Compresto" result={usage} onRefresh={refreshUsage} loading={loading} />
+      <OutputPanel {...{ t, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir }} />
+      <UsagePanel provider="Compresto" result={usage} onRefresh={refreshUsage} loading={loading} t={t} />
     </div>
   );
 }
 
 function TinifySettings({
+  t,
   config,
   persistKeyChange,
   notify,
@@ -1190,25 +1409,25 @@ function TinifySettings({
   setOutputPolicy,
   chooseOutputDir,
   customOutputDir,
-  toggleKeepAwake,
   usage,
   refreshUsage,
   loading,
+  keyUsageLabels,
 }: SettingsProps & {
   options: CompressOptions;
   setOptions: (options: CompressOptions) => void;
 }) {
   return (
     <div className="settings-content">
-      <Panel title="API Key" icon={<KeyRound size={18} />}>
-        <ApiKeyManager provider="Tinify" config={config} persistKeyChange={persistKeyChange} notify={notify} />
+      <Panel title={t("panel.apiKey")} icon={<KeyRound size={18} />}>
+        <ApiKeyManager provider="Tinify" config={config} persistKeyChange={persistKeyChange} notify={notify} t={t} keyUsageLabels={keyUsageLabels} />
       </Panel>
 
-      <Panel title="Tinify 参数" icon={<Layers3 size={18} />}>
+      <Panel title={t("panel.tinifyOptions")} icon={<Layers3 size={18} />}>
         <label>
-          输出格式
+          {t("tinify.format")}
           <select value={options.format} onChange={(event) => setOptions({ ...options, format: event.target.value })}>
-            <option value="same">保持原格式</option>
+            <option value="same">{t("tinify.formatSame")}</option>
             <option value="jpg">JPG</option>
             <option value="png">PNG</option>
             <option value="webp">WebP</option>
@@ -1216,21 +1435,21 @@ function TinifySettings({
         </label>
         <div className="split">
           <label>
-            最大宽度
+            {t("tinify.maxWidth")}
             <input
               type="number"
               min="1"
-              placeholder="自动"
+              placeholder={t("tinify.auto")}
               value={options.maxWidth ?? ""}
               onChange={(event) => setOptions({ ...options, maxWidth: optionalNumber(event.target.value) })}
             />
           </label>
           <label>
-            最大高度
+            {t("tinify.maxHeight")}
             <input
               type="number"
               min="1"
-              placeholder="自动"
+              placeholder={t("tinify.auto")}
               value={options.maxHeight ?? ""}
               onChange={(event) => setOptions({ ...options, maxHeight: optionalNumber(event.target.value) })}
             />
@@ -1242,25 +1461,18 @@ function TinifySettings({
             checked={options.preserveMetadata}
             onChange={(event) => setOptions({ ...options, preserveMetadata: event.target.checked })}
           />
-          保留 Tinify 支持的 metadata
-        </label>
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={options.preserveComfyWorkflow}
-            onChange={(event) => setOptions({ ...options, preserveComfyWorkflow: event.target.checked })}
-          />
-          保留 ComfyUI workflow 配置
+          {t("tinify.preserveMetadata")}
         </label>
       </Panel>
 
-      <OutputPanel {...{ config, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir, toggleKeepAwake }} />
-      <UsagePanel provider="Tinify" result={usage} onRefresh={refreshUsage} loading={loading} />
+      <OutputPanel {...{ t, outputPolicy, setOutputPolicy, chooseOutputDir, customOutputDir }} />
+      <UsagePanel provider="Tinify" result={usage} onRefresh={refreshUsage} loading={loading} t={t} />
     </div>
   );
 }
 
 type SettingsProps = {
+  t: Translator;
   config: AppConfig;
   persistKeyChange: (config: AppConfig, message: string) => void;
   notify: (message: string, tone?: ToastTone) => void;
@@ -1268,10 +1480,10 @@ type SettingsProps = {
   setOutputPolicy: (policy: OutputPolicy) => void;
   chooseOutputDir: () => void;
   customOutputDir: string;
-  toggleKeepAwake: (enabled: boolean) => void;
   usage: UsageResult | null;
   refreshUsage: () => void;
   loading: boolean;
+  keyUsageLabels: KeyUsageLabels;
 };
 
 function ApiKeyManager({
@@ -1279,11 +1491,15 @@ function ApiKeyManager({
   config,
   persistKeyChange,
   notify,
+  t,
+  keyUsageLabels,
 }: {
   provider: Provider;
   config: AppConfig;
   persistKeyChange: (config: AppConfig, message: string) => void;
   notify: (message: string, tone?: ToastTone) => void;
+  t: Translator;
+  keyUsageLabels: KeyUsageLabels;
 }) {
   const [draftKey, setDraftKey] = useState("");
   const [pendingDelete, setPendingDelete] = useState<ApiKeyEntry | null>(null);
@@ -1294,7 +1510,7 @@ function ApiKeyManager({
     const key = draftKey.trim();
     if (!key) return;
     if (hasDuplicateKey(keys, key)) {
-      notify(`${provider} API Key 已存在，请勿重复添加。`, "error");
+      notify(t("key.duplicate", { provider }), "error");
       return;
     }
 
@@ -1306,6 +1522,7 @@ function ApiKeyManager({
       limit: null,
       remaining: null,
       lastCheckedAt: null,
+      quotaExhausted: false,
     };
     persistKeyChange(
       setProviderKeys(
@@ -1313,13 +1530,13 @@ function ApiKeyManager({
         provider,
         [...keys, entry],
       ),
-      `${provider} API Key 已添加。`,
+      t("key.added", { provider }),
     );
     setDraftKey("");
   }
 
   function activateKey(id: string) {
-    persistKeyChange(setActiveKeyId(config, provider, id), `${provider} 已切换当前 API Key。`);
+    persistKeyChange(setActiveKeyId(config, provider, id), t("key.switched", { provider }));
   }
 
   function removeKey(entry: ApiKeyEntry) {
@@ -1327,7 +1544,7 @@ function ApiKeyManager({
     const nextConfig = setProviderKeys(config, provider, nextKeys);
     persistKeyChange(
       setActiveKeyId(nextConfig, provider, nextKeys[0]?.id ?? null),
-      `${provider} API Key 已删除。`,
+      t("key.deleted", { provider }),
     );
     setPendingDelete(null);
   }
@@ -1337,7 +1554,7 @@ function ApiKeyManager({
       <div className="key-manager">
         <div className="key-list">
           {keys.length === 0 ? (
-            <div className="key-empty">无 API Key</div>
+            <div className="key-empty">{t("key.empty")}</div>
           ) : (
             keys.map((entry, index) => (
               <div className={entry.id === activeId ? "key-row active" : "key-row"} key={entry.id}>
@@ -1345,11 +1562,13 @@ function ApiKeyManager({
                   <CircleDot size={14} />
                   <span>
                     <strong>{entry.label || `Key ${index + 1}`}</strong>
-                    <small>{entry.lastCheckedAt ? formatDateTime(entry.lastCheckedAt) : "No usage yet"}</small>
+                    <small>{entry.lastCheckedAt ? formatDateTime(entry.lastCheckedAt) : t("usage.never")}</small>
                   </span>
-                  <b>{formatKeyUsage(entry)}</b>
+                  <b className={`key-usage ${keyUsageMeta(provider, entry, keyUsageLabels).tone}`}>
+                    {keyUsageMeta(provider, entry, keyUsageLabels).text}
+                  </b>
                 </button>
-                <button className="icon" type="button" title="删除 API Key" onClick={() => setPendingDelete(entry)}>
+                <button className="icon" type="button" title={t("key.deleteTitle")} onClick={() => setPendingDelete(entry)}>
                   <Trash2 size={15} />
                 </button>
               </div>
@@ -1357,7 +1576,7 @@ function ApiKeyManager({
           )}
         </div>
         <label>
-          添加新的 API Key
+          {t("key.addNew")}
           <input
             type="password"
             value={draftKey}
@@ -1370,14 +1589,15 @@ function ApiKeyManager({
         </label>
         <button type="button" onClick={addKey} disabled={!draftKey.trim()}>
           <Plus size={16} />
-          添加并保存
+          {t("key.addAndSave")}
         </button>
       </div>
       <ConfirmDialog
         open={Boolean(pendingDelete)}
-        title="删除 API Key"
-        message={`确认删除 ${provider} API Key ${pendingDelete?.label ?? ""}？删除后需要重新添加才能继续使用。`}
-        confirmText="删除"
+        title={t("key.deleteTitle")}
+        message={t("key.deleteConfirm", { provider, label: pendingDelete?.label ?? "" })}
+        confirmText={t("key.deleteConfirmButton")}
+        cancelText={t("modal.cancel")}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
           if (pendingDelete) removeKey(pendingDelete);
@@ -1388,40 +1608,30 @@ function ApiKeyManager({
 }
 
 function OutputPanel({
-  config,
+  t,
   outputPolicy,
   setOutputPolicy,
   chooseOutputDir,
   customOutputDir,
-  toggleKeepAwake,
 }: {
-  config: AppConfig;
+  t: Translator;
   outputPolicy: OutputPolicy;
   setOutputPolicy: (policy: OutputPolicy) => void;
   chooseOutputDir: () => void;
   customOutputDir: string;
-  toggleKeepAwake: (enabled: boolean) => void;
 }) {
   return (
-    <Panel title="输出" icon={<FolderOpen size={18} />}>
+    <Panel title={t("panel.output")} icon={<FolderOpen size={18} />}>
       <select value={outputPolicy} onChange={(event) => setOutputPolicy(event.target.value as OutputPolicy)}>
-        <option value="Subdirectory">源文件旁 compressed 文件夹</option>
-        <option value="CustomDirectory">自定义输出目录</option>
-        <option value="Overwrite">覆盖源文件</option>
+        <option value="Subdirectory">{t("output.subdirectory")}</option>
+        <option value="CustomDirectory">{t("output.custom")}</option>
+        <option value="Overwrite">{t("output.overwrite")}</option>
       </select>
       <button className="ghost" type="button" onClick={chooseOutputDir}>
         <FolderOpen size={16} />
-        选择输出目录
+        {t("output.chooseDir")}
       </button>
-      <p className="hint">{outputPolicy === "CustomDirectory" ? customOutputDir || "尚未选择目录" : "compressed/"}</p>
-      <label className="check-row">
-        <input
-          type="checkbox"
-          checked={config.keepAwakeDuringCompression}
-          onChange={(event) => toggleKeepAwake(event.target.checked)}
-        />
-        压缩时保持设备唤醒
-      </label>
+      <p className="hint">{outputPolicy === "CustomDirectory" ? customOutputDir || t("output.noDir") : "compressed/"}</p>
     </Panel>
   );
 }
@@ -1431,42 +1641,44 @@ function UsagePanel({
   result,
   onRefresh,
   loading,
+  t,
 }: {
   provider: Provider;
   result: UsageResult | null;
   onRefresh: () => void;
   loading: boolean;
+  t: Translator;
 }) {
   return (
-    <Panel title="API 使用量" icon={<Gauge size={18} />}>
+    <Panel title={t("panel.usage")} icon={<Gauge size={18} />}>
       <div className="usage-card">
         <strong>{provider}</strong>
         <dl>
-          <dt>Used</dt>
+          <dt>{t("usage.used")}</dt>
           <dd>{result?.used ?? "—"}</dd>
-          <dt>Limit</dt>
+          <dt>{t("usage.limit")}</dt>
           <dd>{result?.limit ?? "—"}</dd>
-          <dt>Remaining</dt>
+          <dt>{t("usage.remaining")}</dt>
           <dd>{result?.remaining ?? "—"}</dd>
         </dl>
-        <p>{result ? `${formatDateTime(result.lastCheckedAt)} · ${result.message}` : "尚未刷新"}</p>
+        <p>{result ? `${formatDateTime(result.lastCheckedAt)} · ${result.message}` : t("usage.never")}</p>
       </div>
       <button type="button" className="refresh-button" onClick={onRefresh} disabled={loading}>
         {loading ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />}
-        刷新
+        {t("usage.refresh")}
       </button>
     </Panel>
   );
 }
 
-function Toast({ toast, onClose }: { toast: ToastMessage | null; onClose: () => void }) {
+function Toast({ toast, onClose, t }: { toast: ToastMessage | null; onClose: () => void; t: Translator }) {
   if (!toast) return null;
 
   return (
     <div className={`toast toast-${toast.tone}`} role="status">
       {toast.tone === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
       <p>{toast.message}</p>
-      <button className="icon toast-close" type="button" title="关闭" onClick={onClose}>
+      <button className="icon toast-close" type="button" title={t("toast.close")} onClick={onClose}>
         <X size={15} />
       </button>
     </div>
@@ -1478,6 +1690,7 @@ function ConfirmDialog({
   title,
   message,
   confirmText,
+  cancelText,
   onCancel,
   onConfirm,
 }: {
@@ -1485,6 +1698,7 @@ function ConfirmDialog({
   title: string;
   message: string;
   confirmText: string;
+  cancelText: string;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -1512,7 +1726,7 @@ function ConfirmDialog({
         </div>
         <div className="confirm-actions">
           <button type="button" onClick={onCancel}>
-            取消
+            {cancelText}
           </button>
           <button type="button" className="danger" onClick={onConfirm}>
             {confirmText}
@@ -1545,12 +1759,12 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
   );
 }
 
-function StatusBadge({ item }: { item: QueueItem }) {
+function StatusBadge({ item, t }: { item: QueueItem; t: Translator }) {
   if (item.isCompressed || item.status === "done") {
     return (
       <span className="badge done">
         <CheckCircle2 size={14} />
-        已压缩
+        {t("badge.done")}
       </span>
     );
   }
@@ -1558,7 +1772,7 @@ function StatusBadge({ item }: { item: QueueItem }) {
     return (
       <span className="badge failed" title={item.error}>
         <AlertCircle size={14} />
-        失败
+        {t("badge.failed")}
       </span>
     );
   }
@@ -1566,11 +1780,11 @@ function StatusBadge({ item }: { item: QueueItem }) {
     return (
       <span className="badge processing">
         <Loader2 className="spin" size={14} />
-        处理中
+        {t("badge.processing")}
       </span>
     );
   }
-  return <span className="badge">待处理</span>;
+  return <span className="badge">{t("badge.queued")}</span>;
 }
 
 function optionalNumber(value: string): number | null {
@@ -1608,9 +1822,23 @@ function activeKey(config: AppConfig, provider: Provider): ApiKeyEntry | undefin
 }
 
 function hasUsableApiKey(config: AppConfig, provider: Provider): boolean {
+  const entry = activeKey(config, provider);
+  if (entry?.quotaExhausted) return false;
+  return hasConfiguredApiKey(config, provider);
+}
+
+function hasConfiguredApiKey(config: AppConfig, provider: Provider): boolean {
   const activeValue = activeKey(config, provider)?.key.trim();
   const legacyValue = provider === "Compresto" ? config.comprestoApiKey.trim() : config.tinifyApiKey.trim();
   return Boolean(activeValue || (legacyValue && !isMaskedSecret(legacyValue)));
+}
+
+function apiKeyUnavailableMessage(config: AppConfig, provider: Provider, t: Translator): string {
+  const entry = activeKey(config, provider);
+  if (entry?.quotaExhausted) {
+    return t("apiKey.unavailableExhausted", { provider });
+  }
+  return t("apiKey.unavailableMissing", { provider });
 }
 
 function hasDuplicateKey(keys: ApiKeyEntry[], value: string): boolean {
@@ -1620,6 +1848,15 @@ function hasDuplicateKey(keys: ApiKeyEntry[], value: string): boolean {
     const savedKey = entry.key.trim();
     return savedKey === normalized || savedKey === masked || entry.label === masked;
   });
+}
+
+function isQuotaExceededMessage(value: unknown): boolean {
+  const text = String(value).toLowerCase();
+  return (
+    text.includes("toomanyrequests") ||
+    text.includes("monthly limit has been exceeded") ||
+    text.includes("quota has been reached")
+  );
 }
 
 function setProviderKeys(config: AppConfig, provider: Provider, keys: ApiKeyEntry[]): AppConfig {
@@ -1661,6 +1898,7 @@ function applyUsageToConfig(
           limit: usage.limit ?? null,
           remaining: usage.remaining ?? null,
           lastCheckedAt: usage.lastCheckedAt,
+          quotaExhausted: false,
         }
       : entry,
   );
@@ -1784,12 +2022,6 @@ function normalizePathForCompare(path: string): string {
 function folderName(path: string): string {
   const normalized = normalizePathForCompare(path);
   return normalized.split("/").filter(Boolean).pop() || normalized || "Folder";
-}
-
-function formatKeyUsage(entry: ApiKeyEntry): string {
-  if (entry.used == null && entry.remaining == null) return "—";
-  if (entry.remaining != null) return `${entry.used ?? "—"} / ${entry.remaining}`;
-  return String(entry.used);
 }
 
 function maskKey(value: string): string {

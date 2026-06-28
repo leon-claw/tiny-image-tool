@@ -1,4 +1,4 @@
-import type { ImageFile, QueueItem } from "./types";
+import type { ApiKeyEntry, ImageFile, Provider, QueueItem, QueueSource } from "./types";
 
 export type StatusFilter = "default" | "queued" | "processing" | "failed" | "done" | "cancelled";
 
@@ -32,7 +32,40 @@ export function toQueueItems(files: ImageFile[], existing: QueueItem[]): QueueIt
       id: file.path,
       status: "queued" as const,
       selected: false,
+      sources: ["manual"] as QueueSource[],
     }));
+}
+
+export function mergeQueueItems(
+  files: ImageFile[],
+  existing: QueueItem[],
+  source: QueueSource,
+): QueueItem[] {
+  const incoming = new Map(files.map((file) => [file.path, file]));
+  const updated = existing.map((item) => {
+    if (!incoming.has(item.path)) return item;
+    const sources = mergeSources(item.sources, source);
+    incoming.delete(item.path);
+    return { ...item, sources };
+  });
+  const additions = Array.from(incoming.values()).map((file) => ({
+    ...file,
+    id: file.path,
+    status: "queued" as const,
+    selected: false,
+    sources: [source],
+  }));
+  return [...updated, ...additions];
+}
+
+export function queueHasSource(item: QueueItem, source: QueueSource): boolean {
+  if (!item.sources?.length) return source === "manual";
+  return item.sources.includes(source);
+}
+
+function mergeSources(sources: QueueSource[] | undefined, source: QueueSource): QueueSource[] {
+  const next = sources?.length ? [...sources] : ["manual" as const];
+  return next.includes(source) ? next : [...next, source];
 }
 
 export function totalBytes(items: QueueItem[], key: "size" | "compressedSize"): number {
@@ -58,3 +91,33 @@ export function queueStatus(item: QueueItem): Exclude<StatusFilter, "default"> {
   if (item.isCompressed || item.status === "done") return "done";
   return item.status;
 }
+
+export function keyUsageMeta(
+  provider: Provider,
+  entry: ApiKeyEntry,
+  labels: KeyUsageLabels = zhKeyUsageLabels,
+): { text: string; tone: "neutral" | "used" | "remaining" | "exhausted" } {
+  if (entry.quotaExhausted) return { text: labels.exhausted, tone: "exhausted" };
+  if (provider === "Compresto") {
+    if (entry.remaining != null) return { text: labels.remaining(entry.remaining), tone: "remaining" };
+    if (entry.used != null) return { text: labels.used(entry.used), tone: "used" };
+    return { text: labels.noUsage, tone: "neutral" };
+  }
+  if (entry.used != null) return { text: labels.used(entry.used), tone: "used" };
+  if (entry.remaining != null) return { text: labels.remaining(entry.remaining), tone: "remaining" };
+  return { text: labels.noUsage, tone: "neutral" };
+}
+
+export type KeyUsageLabels = {
+  exhausted: string;
+  noUsage: string;
+  remaining: (count: number) => string;
+  used: (count: number) => string;
+};
+
+const zhKeyUsageLabels: KeyUsageLabels = {
+  exhausted: "已耗尽",
+  noUsage: "—",
+  remaining: (count) => `余 ${count}`,
+  used: (count) => `用 ${count}`,
+};

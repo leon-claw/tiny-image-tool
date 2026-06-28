@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, prioritizeQueueByStatus, toQueueItems, totalBytes } from "./utils";
+import { formatBytes, keyUsageMeta, mergeQueueItems, queueHasSource, prioritizeQueueByStatus, toQueueItems, totalBytes } from "./utils";
 
 describe("utils", () => {
   it("formats bytes for compact display", () => {
@@ -20,6 +20,27 @@ describe("utils", () => {
 
     expect(items).toHaveLength(1);
     expect(items[0].path).toBe("/b.png");
+  });
+
+  it("keeps watched files out of the manual workspace until the user adds them", () => {
+    const watched = mergeQueueItems(
+      [{ path: "/watch/a.png", name: "a.png", extension: "png", size: 100, isCompressed: false }],
+      [],
+      "watch",
+    );
+
+    expect(queueHasSource(watched[0], "watch")).toBe(true);
+    expect(queueHasSource(watched[0], "manual")).toBe(false);
+
+    const manuallyAdded = mergeQueueItems(
+      [{ path: "/watch/a.png", name: "a.png", extension: "png", size: 100, isCompressed: false }],
+      watched,
+      "manual",
+    );
+
+    expect(manuallyAdded).toHaveLength(1);
+    expect(queueHasSource(manuallyAdded[0], "watch")).toBe(true);
+    expect(queueHasSource(manuallyAdded[0], "manual")).toBe(true);
   });
 
   it("totals optional compressed sizes", () => {
@@ -52,5 +73,24 @@ describe("utils", () => {
     ]);
     expect(prioritizeQueueByStatus(items, "done").map((item) => item.id)[0]).toBe("done-a");
     expect(prioritizeQueueByStatus(items, "default")).toBe(items);
+  });
+
+  it("labels api key usage differently by provider", () => {
+    const entry = {
+      id: "key",
+      label: "key",
+      key: "secret",
+      used: 12,
+      remaining: 88,
+      limit: 100,
+      lastCheckedAt: null,
+    };
+
+    expect(keyUsageMeta("Compresto", entry)).toEqual({ text: "余 88", tone: "remaining" });
+    expect(keyUsageMeta("Tinify", entry)).toEqual({ text: "用 12", tone: "used" });
+    expect(keyUsageMeta("Tinify", { ...entry, quotaExhausted: true })).toEqual({
+      text: "已耗尽",
+      tone: "exhausted",
+    });
   });
 });

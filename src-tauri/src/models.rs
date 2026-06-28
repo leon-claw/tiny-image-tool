@@ -33,6 +33,10 @@ pub struct AppConfig {
     pub watch_folders: Vec<WatchFolderConfig>,
     #[serde(default = "default_true")]
     pub keep_awake_during_compression: bool,
+    #[serde(default = "default_true")]
+    pub preserve_comfy_workflow: bool,
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 impl Default for AppConfig {
@@ -50,6 +54,8 @@ impl Default for AppConfig {
             watch_folder_path: None,
             watch_folders: Vec::new(),
             keep_awake_during_compression: true,
+            preserve_comfy_workflow: true,
+            language: default_language(),
         }
     }
 }
@@ -73,12 +79,18 @@ impl AppConfig {
             watch_folder_path: self.watch_folder_path.clone(),
             watch_folders: self.watch_folders.clone(),
             keep_awake_during_compression: self.keep_awake_during_compression,
+            preserve_comfy_workflow: self.preserve_comfy_workflow,
+            language: self.language.clone(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_language() -> String {
+    "zh".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +140,8 @@ pub struct ApiKeyEntry {
     pub remaining: Option<u32>,
     #[serde(default)]
     pub last_checked_at: Option<String>,
+    #[serde(default)]
+    pub quota_exhausted: bool,
 }
 
 impl ApiKeyEntry {
@@ -145,6 +159,7 @@ impl ApiKeyEntry {
             limit: self.limit,
             remaining: self.remaining,
             last_checked_at: self.last_checked_at.clone(),
+            quota_exhausted: self.quota_exhausted,
         }
     }
 }

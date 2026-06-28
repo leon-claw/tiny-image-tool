@@ -96,6 +96,49 @@ pub fn update_usage_for_key(
     save_exact_config(&config)
 }
 
+pub fn mark_api_key_quota_exhausted(
+    provider: Provider,
+    key_id: Option<&str>,
+) -> Result<(), ConfigError> {
+    let mut config = load_raw_config().unwrap_or_default();
+    update_key_quota_exhausted(&mut config, provider, key_id);
+    save_exact_config(&config)
+}
+
+fn update_key_quota_exhausted(config: &mut AppConfig, provider: Provider, key_id: Option<&str>) {
+    let normalized = normalize_app_config(config.clone());
+    *config = normalized;
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    let (entries, active_id) = match provider {
+        Provider::Compresto => (
+            &mut config.compresto_keys,
+            config.active_compresto_key_id.clone(),
+        ),
+        Provider::Tinify => (&mut config.tinify_keys, config.active_tinify_key_id.clone()),
+    };
+    let selected_id = key_id.map(ToOwned::to_owned).or(active_id);
+    let index = entries
+        .iter()
+        .position(|entry| Some(entry.id.as_str()) == selected_id.as_deref())
+        .or_else(|| {
+            key_id
+                .is_none()
+                .then(|| (!entries.is_empty()).then_some(0))
+                .flatten()
+        });
+
+    if let Some(index) = index {
+        let entry = &mut entries[index];
+        entry.quota_exhausted = true;
+        entry.remaining = Some(0);
+        entry.last_checked_at = Some(checked_at.clone());
+    }
+
+    if matches!(provider, Provider::Tinify) {
+        config.tinify_last_checked_at = Some(checked_at);
+    }
+}
+
 pub fn api_key_for(provider: Provider, key_id: Option<&str>) -> Result<String, ConfigError> {
     let config = load_raw_config()?;
     let key = match provider {
@@ -140,6 +183,9 @@ fn save_exact_config(config: &AppConfig) -> Result<(), ConfigError> {
 }
 
 fn normalize_app_config(mut config: AppConfig) -> AppConfig {
+    if !matches!(config.language.as_str(), "zh" | "en") {
+        config.language = "zh".to_string();
+    }
     config.watch_folder_path = config
         .watch_folder_path
         .and_then(|path| (!path.trim().is_empty()).then(|| path.trim().to_string()));
@@ -321,6 +367,7 @@ fn update_key_usage_fields(
         entry.limit = limit;
         entry.remaining = remaining;
         entry.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
+        entry.quota_exhausted = false;
     }
 }
 
@@ -367,6 +414,7 @@ fn entry_from_legacy(
         limit,
         remaining,
         last_checked_at,
+        quota_exhausted: false,
     }
 }
 
@@ -437,6 +485,7 @@ mod tests {
             limit: None,
             remaining,
             last_checked_at: None,
+            quota_exhausted: false,
         }
     }
 
@@ -497,6 +546,36 @@ mod tests {
         assert_eq!(second.used, Some(42));
         assert_eq!(second.limit, Some(100));
         assert_eq!(second.remaining, Some(58));
+        assert!(!second.quota_exhausted);
+    }
+
+    #[test]
+    fn marks_quota_exhausted_for_requested_key_id() {
+        let mut config = AppConfig {
+            tinify_keys: vec![
+                entry("key-a", "alpha-key", Some(3), None),
+                entry("key-b", "beta-key", Some(10), None),
+            ],
+            active_tinify_key_id: Some("key-a".to_string()),
+            ..AppConfig::default()
+        };
+
+        update_key_quota_exhausted(&mut config, Provider::Tinify, Some("key-b"));
+
+        let first = config
+            .tinify_keys
+            .iter()
+            .find(|entry| entry.id == "key-a")
+            .unwrap();
+        let second = config
+            .tinify_keys
+            .iter()
+            .find(|entry| entry.id == "key-b")
+            .unwrap();
+
+        assert!(!first.quota_exhausted);
+        assert!(second.quota_exhausted);
+        assert_eq!(second.remaining, Some(0));
     }
 
     #[test]
@@ -541,5 +620,18 @@ mod tests {
         let normalized = normalize_app_config(config);
 
         assert_eq!(normalized.watch_folders.len(), 1);
+    }
+
+    #[test]
+    fn defaults_and_normalizes_language() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.language, "zh");
+        assert!(config.preserve_comfy_workflow);
+
+        config.language = "fr".to_string();
+        let normalized = normalize_app_config(config);
+
+        assert_eq!(normalized.language, "zh");
+        assert!(normalized.preserve_comfy_workflow);
     }
 }

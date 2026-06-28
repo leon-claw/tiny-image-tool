@@ -1,0 +1,101 @@
+export const siteNav = {
+  brand: "Tiny Image Tool",
+  tagline: "Desktop compression",
+  links: [
+    { label: "为什么", href: "#features" },
+    { label: "怎么用", href: "#workflow" },
+    { label: "额度", href: "#providers" },
+    { label: "下载", href: "#download" },
+  ],
+  cta: { label: "下载应用", href: "https://github.com/leon-claw/tiny-image-tool/releases" },
+};
+
+export const hero = {
+  eyebrow: "Desktop compressor for Tinify / Compresto",
+  title: "自动榨干免费额度的桌面图片压缩工具。",
+  body: "Tiny Image Tool 监控你的素材文件夹，发现新图后自动入队、并行压缩，并智能跳过已经处理过的图片。适合 Tinify、Compresto 和 ComfyUI 输出目录的长期批量工作流。",
+  primaryCta: { label: "下载应用", href: "https://github.com/leon-claw/tiny-image-tool/releases" },
+  secondaryCta: { label: "看工作方式", href: "#workflow" },
+  note: "重点很简单：少手动、少浪费 API 次数，压缩图片时尽量保留 ComfyUI workflow。",
+};
+
+export const mockup = {
+  brand: "Tiny Image Tool",
+  railItems: ["工作台", "监控文件夹"],
+  toolbarTitle: "压缩工作台",
+  toolbarBody: "文件夹里的新图片自动进入队列，已压缩文件直接跳过。",
+  actions: ["添加文件", "监控文件夹", "并行压缩"],
+  metrics: [
+    { label: "文件", value: "128", detail: "124 已选" },
+    { label: "已跳过", value: "36", detail: "已压缩命中" },
+    { label: "完成", value: "92", detail: "0 failed" },
+    { label: "压缩率", value: "70%", detail: "肉眼不可区别" },
+  ],
+  files: [
+    { name: "hero-banner.png", path: "/campaign/home", before: "4.8 MB", after: "1.6 MB", status: "done" },
+    { name: "gallery-03.webp", path: "/assets/gallery", before: "1.9 MB", after: "620 KB", status: "done" },
+    { name: "product-shot.avif", path: "/release/media", before: "860 KB", after: "queued", status: "queued" },
+  ],
+  settingsTitle: "设置",
+  settings: ["Tinify / Compresto", "多个账号", "保留 workflow", "输出到 compressed/"],
+};
+
+export const metrics = [
+  { icon: "image", label: "效果", value: "70%", detail: "Tinify 是目前最强的图片压缩工具之一，肉眼不可区别时压缩率可达 70%" },
+  { icon: "key", label: "限制", value: "500 次/月", detail: "Tinify 只能通过 API 调用，每个账号每月只有 500 次免费额度" },
+  { icon: "folder", label: "痛点", value: "批量目录", detail: "截图、设计导出和 ComfyUI 输出会持续产生新图，手动上传很快变成重复劳动" },
+  { icon: "gauge", label: "目标", value: "不浪费", detail: "只压缩真正需要处理的图片，把免费调用留给有价值的文件" },
+];
+
+export const workflow = {
+  eyebrow: "How it works",
+  title: "把压缩流程变成本地自动队列。",
+  body: "你只需要配置一次目录和 API Key，之后交给应用判断、排队和执行。",
+  steps: [
+    { icon: "plus", title: "选择目录", body: "把截图、设计素材或 ComfyUI 输出目录加入监控列表。" },
+    { icon: "refresh", title: "识别新图", body: "应用扫描新增图片，同时检查是否已经压缩过。" },
+    { icon: "play", title: "并行压缩", body: "需要处理的文件进入队列，并通过 Tinify 或 Compresto API 批量执行。" },
+    { icon: "sliders", title: "写回结果", body: "完成后记录状态、体积变化和跳过原因，后续扫描不会重复消耗额度。" },
+  ],
+};
+
+export const featureBands = [
+  {
+    icon: "folder-tree",
+    eyebrow: "Quota strategy",
+    title: "多个账号自动切换，免费额度尽量用满。",
+    body: "Tinify 和 Compresto 的压缩效果强，但 API 次数有限。你可以注册多个账号，把 Key 都加进来；一个额度用完后，应用会切到下一个可用账号。",
+    bullets: ["多个 API Key 管理", "自动切换可用账号", "智能跳过已压缩图片", "减少重复调用"],
+  },
+  {
+    icon: "shield",
+    eyebrow: "ComfyUI safe",
+    title: "压缩图片，也尽量保住 ComfyUI workflow。",
+    body: "很多图片压缩流程会清掉 PNG metadata，导致 ComfyUI 的工作流信息丢失。Tiny Image Tool 为这类素材保留专门选项，让压缩不再和工作流安全互相冲突。",
+    bullets: ["可保留 ComfyUI workflow", "适合输出目录监控", "输出位置可控", "本地桌面工作流"],
+  },
+];
+
+export const providers = {
+  eyebrow: "API providers",
+  title: "接入高质量压缩服务，但把调用权握在自己手里。",
+  body: "服务商负责压缩效果，Tiny Image Tool 负责本地批处理、额度判断和任务记录。",
+  cards: [
+    { icon: "image", title: "Tinify / TinyPNG", body: "高压缩率、低感知损失，适合需要稳定画质的图片批处理。" },
+    { icon: "sparkles", title: "Compresto", body: "补充现代图片压缩链路，为不同格式和策略提供另一组选择。" },
+    { icon: "layers", title: "本地任务控制", body: "任务、跳过记录、输出目录和 workflow 选项都留在桌面应用里管理。" },
+  ],
+};
+
+export const download = {
+  eyebrow: "Download",
+  title: "让图片压缩从一次次手动操作，变成后台自动流程。",
+  body: "下载后添加 API Key，选择监控文件夹，就可以开始批量压缩、节省调用次数，并保护 ComfyUI workflow。",
+  actions: [
+    { label: "下载 macOS 版本", href: "https://github.com/leon-claw/tiny-image-tool/releases" },
+    { label: "下载 Windows 版本", href: "https://github.com/leon-claw/tiny-image-tool/releases" },
+  ],
+  footnote: "当前版本基于 Tauri、React 和 TypeScript 构建，下载入口会跳转到 GitHub Releases。",
+};
+
+Tiny Image Tool 是一个跨平台桌面图片压缩工具，适合需要长期处理素材目录、节省 API 调用次数，并保留 ComfyUI workflow 的本地工作流。
